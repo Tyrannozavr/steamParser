@@ -418,17 +418,24 @@ class StickerPricesAPI:
                         proxy = current_proxy_obj.url
                         logger.debug(f"🌐 StickerPricesAPI: Используем прокси ID={current_proxy_obj.id} из proxy_manager для priceoverview")
                 
+                # ВАЖНО: Добавляем префикс "Sticker |" если его нет
+                # Это нужно для правильного поиска цены наклейки
+                query_name = sticker_name
+                if not sticker_name.startswith("Sticker"):
+                    query_name = f"Sticker | {sticker_name}"
+                    logger.debug(f"🔧 StickerPricesAPI: Добавлен префикс 'Sticker |' к названию '{sticker_name}' -> '{query_name}'")
+                
                 # URL-кодируем название для использования в URL
-                encoded_hash_name = quote(sticker_name, safe='')
+                encoded_hash_name = quote(query_name, safe='')
                 
                 # Формируем URL API
                 params = {
                     'appid': appid,
                     'currency': currency,
-                    'market_hash_name': sticker_name
+                    'market_hash_name': query_name
                 }
                 
-                logger.debug(f"🌐 StickerPricesAPI: Запрашиваем priceoverview для '{sticker_name}'")
+                logger.debug(f"🌐 StickerPricesAPI: Запрашиваем priceoverview для '{query_name}' (исходное: '{sticker_name}')")
                 
                 async with httpx.AsyncClient(proxy=proxy, timeout=timeout) as client:
                     headers = {
