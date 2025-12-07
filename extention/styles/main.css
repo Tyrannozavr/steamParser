@@ -1,0 +1,473 @@
+:root {
+  --primary-color: #22c55e;
+  --secondary-color: #16a34a;
+  --success-color: #22c55e;
+  --warning-color: #f59e0b;
+  --danger-color: #ef4444;
+  --info-color: #3b82f6;
+  --highlight-color: #22c55e;
+  --gold-color: #fbbf24;
+  --orange-color: #f97316;
+  --red-color: #ef4444;
+  --green-color: #22c55e;
+  --purple-color: #8b5cf6;
+  
+  --text-primary: #ffffff;
+  --text-secondary: #b8d4ff;
+  --text-muted: #94b3d8;
+  
+  --border-radius-sm: 3px;
+  --border-radius-md: 6px;
+  --border-radius-lg: 12px;
+  
+  --box-shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.2);
+  --box-shadow-md: 0 4px 8px rgba(0, 0, 0, 0.3);
+  --box-shadow-lg: 0 4px 16px rgba(34, 197, 94, 0.3);
+}
+
+.cs2-float-info {
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--primary-color);
+  border-radius: var(--border-radius-md);
+  font-size: 12px;
+  box-shadow: var(--box-shadow-sm);
+}
+
+.float-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  margin-bottom: 4px;
+}
+
+.float-main.low-float {
+  background: var(--success-color);
+  animation: pulse-green 2s infinite;
+}
+
+.float-main.high-float {
+  background: var(--orange-color);
+  animation: pulse-orange 2s infinite;
+}
+
+@keyframes pulse-green {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
+}
+
+@keyframes pulse-orange {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
+}
+
+.float-main.top-tier {
+  background: var(--highlight-color);
+  animation: pulse-premium 2s infinite;
+  border: 1px solid rgba(255, 215, 0, 0.5);
+}
+
+@keyframes pulse-premium {
+  0%, 100% { 
+    opacity: 1;
+    box-shadow: 0 0 10px rgba(240, 147, 251, 0.5);
+  }
+  50% { 
+    opacity: 0.9;
+    box-shadow: 0 0 20px rgba(240, 147, 251, 0.8);
+  }
+}
+
+.float-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.float-value {
+  color: var(--text-primary);
+  font-weight: bold;
+  font-family: 'Courier New', monospace;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.float-value:hover {
+  color: var(--gold-color);
+  text-shadow: 0 0 5px rgba(255, 215, 0, 0.5);
+}
+
+.float-rank {
+  background: var(--gold-color);
+  color: white;
+  padding: 2px 6px;
+  border-radius: var(--border-radius-lg);
+  font-size: 10px;
+  font-weight: bold;
+  margin-left: 8px;
+}
+
+.float-details-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.float-detail.stattrak {
+  background: var(--red-color);
+  padding: 3px 8px;
+  border-radius: 4px;
+}
+
+.float-detail.souvenir {
+  background: var(--gold-color);
+  color: #333;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-weight: bold;
+}
+
+.wear-name {
+  color: var(--gold-color);
+  font-weight: 500;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--border-radius-sm);
+  font-size: 11px;
+}
+
+.float-detail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 3px;
+  margin-top: 4px;
+}
+
+.detail-label {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.detail-value {
+  color: var(--text-primary);
+  font-weight: 500;
+  font-size: 11px;
+}
+
+.stickers-info {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.sticker-item {
+  width: 24px;
+  height: 24px;
+  background: var(--info-color);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.sticker-item:hover {
+  transform: scale(1.1);
+}
+
+.sticker-wear {
+  color: white;
+  font-size: 9px;
+  font-weight: bold;
+}
+
+.cs2-float-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 10;
+}
+
+.badge-content {
+  background: var(--info-color);
+  color: white;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: bold;
+  box-shadow: var(--box-shadow-sm);
+}
+
+.badge-content.badge-low {
+  background: var(--success-color);
+}
+
+.badge-content.badge-high {
+  background: var(--danger-color);
+}
+
+.cs2-float-button {
+  background: var(--info-color);
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: var(--border-radius-md);
+  font-weight: 600;
+  cursor: pointer;
+  margin: 10px;
+  transition: all 0.3s;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.cs2-float-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+}
+
+.cs2-filter-controls {
+  background: var(--primary-color);
+  padding: 12px;
+  border-radius: 8px;
+  margin-top: 10px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.filter-group label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.filter-group input {
+  padding: 4px 8px;
+  border: 1px solid #4a6fa5;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  font-size: 12px;
+  width: 100px;
+}
+
+.filter-group input::placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+#applyFilters, #clearFilters {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+#applyFilters {
+  background: var(--success-color);
+  color: white;
+}
+
+#clearFilters {
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+#applyFilters:hover, #clearFilters:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.matches-filter {
+  border-left: 4px solid var(--green-color) !important;
+}
+
+.hidden-by-filter {
+  display: none !important;
+}
+
+.market_listing_row {
+  transition: all 0.3s;
+}
+
+.cs2-popup {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  background: var(--info-color);
+  color: white;
+  padding: 12px 20px;
+  border-radius: 8px;
+  box-shadow: var(--box-shadow-md);
+  z-index: 10000;
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.cs2-loading {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-radius: 50%;
+  border-top-color: white;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.cs2-toast {
+  position: fixed;
+  bottom: -60px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--info-color);
+  color: white;
+  padding: 12px 24px;
+  border-radius: 8px;
+  box-shadow: var(--box-shadow-md);
+  z-index: 100000;
+  transition: bottom 0.3s ease-out;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.cs2-toast.show {
+  bottom: 30px;
+}
+
+.cs2-toast.success {
+  background: var(--success-color);
+}
+
+.cs2-toast.error {
+  background: var(--danger-color);
+}
+
+.cs2-toast.warning {
+  background: var(--warning-color);
+}
+
+.inspect-link-input {
+  width: 100%;
+  padding: 10px;
+  border: 2px solid #667eea;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.95);
+  font-size: 14px;
+  margin: 10px 0;
+  transition: all 0.3s;
+}
+
+.inspect-link-input:focus {
+  outline: none;
+  border-color: #764ba2;
+  box-shadow: 0 0 10px rgba(118, 75, 162, 0.3);
+}
+
+.market-trend-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 8px;
+}
+
+.market-trend-indicator.rising {
+  background: rgba(17, 153, 142, 0.2);
+  color: #38ef7d;
+}
+
+.market-trend-indicator.falling {
+  background: rgba(235, 51, 73, 0.2);
+  color: #f45c43;
+}
+
+.market-trend-indicator.stable {
+  background: rgba(255, 255, 255, 0.1);
+  color: #b8d4ff;
+}
+
+/* Enhanced Rarity Colors */
+.rarity-value.rarity-consumer {
+  color: #a1a1aa;
+}
+
+.rarity-value.rarity-industrial {
+  color: #06b6d4;
+}
+
+.rarity-value.rarity-milspec {
+  color: #22c55e;
+  font-weight: 600;
+}
+
+.rarity-value.rarity-restricted {
+  color: #8b5cf6;
+  font-weight: 600;
+}
+
+.rarity-value.rarity-classified {
+  color: #ec4899;
+  font-weight: 600;
+}
+
+.rarity-value.rarity-covert {
+  color: #f59e0b;
+  font-weight: 600;
+}
+
+.rarity-value.rarity-contraband {
+  color: #fbbf24;
+  font-weight: 700;
+  text-shadow: 0 0 4px rgba(251, 191, 36, 0.4);
+}
+
+/* Enhanced float detail styling */
+.float-detail {
+  font-size: 11px;
+  opacity: 0.9;
+  margin-top: 2px;
+}
+
+.float-detail .label {
+  opacity: 0.7;
+  margin-right: 4px;
+}
+
+.float-detail .value {
+  font-weight: 500;
+}

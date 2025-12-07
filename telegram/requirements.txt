@@ -1,0 +1,24 @@
+# Telegram Bot зависимости
+aiogram>=3.2.0
+
+# Общие зависимости
+httpx>=0.25.0
+pydantic>=2.5.0
+
+# Для парсинга HTML (нужно для импортов из parsers)
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# База данных
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0
+
+# Логирование
+loguru>=0.7.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Redis
+redis>=5.0.0
+

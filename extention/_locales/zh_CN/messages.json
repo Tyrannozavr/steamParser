@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2浮动值检查器专业版",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "专业的CS2浮动值检查器，具有高级缓存、即时结果和全面的Steam集成。比竞争对手更好。",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2浮动值检查器专业版 - 点击配置",
+    "description": "Extension title shown on hover"
+  }
+}

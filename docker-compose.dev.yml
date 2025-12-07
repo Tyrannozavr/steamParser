@@ -1,0 +1,133 @@
+services:
+
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: steam-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-steam_monitor}
+      - POSTGRES_USER=${POSTGRES_USER:-steam_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-steam_password}
+    # ports:
+    #   - "5432:5432"  # Временно скрыто
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/init-db.sh
+      - ./migrations:/docker-entrypoint-initdb.d/migrations:ro
+    networks:
+      - steam-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-steam_user} -d ${POSTGRES_DB:-steam_monitor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis для коммуникации между сервисами
+  redis:
+    image: redis:7-alpine
+    container_name: steam-redis
+    restart: unless-stopped
+    # ports:
+    #   - "6379:6379"  # Временно скрыто
+    volumes:
+      - redis-data:/data
+    networks:
+      - steam-network
+    command: redis-server --appendonly yes
+
+  # Telegram бот - управление через Telegram
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: telegram/Dockerfile.dev
+    container_name: steam-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./docker/apply-migrations.sh:/app/docker/apply-migrations.sh:ro
+      - ./migrations:/app/migrations:ro
+      - .:/app  # Монтируем код для hot-reload
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - LOG_DIR=${LOG_DIR:-/app/logs}
+      - REDIS_ENABLED=true
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - steam-network
+
+  # Parsing Worker - выполнение задач парсинга
+  # Параллельная обработка через корутины (asyncio) в одном контейнере
+  # Использует Redis Streams как брокер сообщений (как Kafka)
+  parsing-worker:
+    build:
+      context: .
+      dockerfile: parsing/Dockerfile.dev
+    container_name: steam-parsing-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - .:/app  # Монтируем код для hot-reload
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - LOG_DIR=${LOG_DIR:-/app/logs}
+      - REDIS_ENABLED=true
+      - REDIS_URL=redis://redis:6379/0
+      - ENABLE_MONITORING_SERVICE=${ENABLE_MONITORING_SERVICE:-true}
+      # Максимальное количество одновременных задач (параллелизм через корутины)
+      - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      telegram-bot:
+        condition: service_started
+    networks:
+      - steam-network
+  # Parser API - сервис для работы с парсером через Redis
+  parser-api:
+    build:
+      context: .
+      dockerfile: parser_api/Dockerfile
+    container_name: steam-parser-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - .:/app  # Монтируем код для hot-reload
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=${LOG_DIR:-/app/logs}
+      - REDIS_ENABLED=true
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - steam-network
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  steam-network:
+    driver: bridge

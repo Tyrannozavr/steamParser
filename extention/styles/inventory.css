@@ -1,0 +1,87 @@
+/* Ensure inventory item containers are positioned relatively */
+.inventory_page .item,
+.inventory_page .itemHolder,
+[id*="730_2_"] {
+  position: relative;
+}
+
+.item-info {
+  font-family: Roboto;
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  display: flex;
+  flex-direction: column;
+  z-index: 10;
+}
+
+.item-info-paintseed {
+  font-family: Roboto;
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: flex;
+  flex-direction: column;
+  z-index: 11;
+}
+
+.item-info .float-data {
+  width: 96px;
+  display: flex;
+  flex-direction: column;
+  color: rgb(255, 255, 255);
+  font-size: 11px;
+  box-sizing: border-box;
+}
+
+.item-info .item_row {
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  justify-content: space-between;
+  z-index: 7;
+  white-space: nowrap;
+  overflow: hidden;
+  background-color: transparent;
+}
+
+.item-info .item_row .float-value:hover {
+  background-color: rgba(0, 0, 0, 0.7);
+}
+
+.item-info .item_row__transparent {
+  padding: 0px 4px;
+  background-color: rgba(0, 0, 0, 0);
+}
+
+.item-info .item_row__transparent:hover {
+  background-color: rgba(0, 0, 0, 0);
+}
+
+.item-info .item_row__value {
+  padding: 2px 1px 2px 0px;
+}
+
+.item-info .item_row .float-value {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  font-size: clamp(10px, 2vw, 11px);
+  cursor: pointer;
+  text-align: right;
+  font-family: Consolas, monospace;
+}
+
+.copy-notification {
+  display: none;
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background-color: rgba(0, 0, 0, 0.7);
+  color: white;
+  padding: 10px;
+  border-radius: 5px;
+  z-index: 1000;
+  font-size: 14px;
+}

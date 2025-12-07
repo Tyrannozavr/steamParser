@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "高度なキャッシング、即座の結果、包括的なSteam統合を備えたプロフェッショナルなCS2フロート値チェッカー。競合他社より優れています。",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - クリックして設定",
+    "description": "Extension title shown on hover"
+  }
+}

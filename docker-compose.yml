@@ -1,0 +1,146 @@
+services:
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: steam-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-steam_monitor}
+      - POSTGRES_USER=${POSTGRES_USER:-steam_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-steam_password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/init-db.sh
+      - ./migrations:/docker-entrypoint-initdb.d/migrations:ro
+    networks:
+      - steam-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-steam_user} -d ${POSTGRES_DB:-steam_monitor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis для коммуникации между сервисами
+  redis:
+    image: redis:7-alpine
+    container_name: steam-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - steam-network
+    command: redis-server --appendonly yes
+
+  # Telegram бот - управление через Telegram
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: telegram/Dockerfile
+    container_name: steam-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./docker/apply-migrations.sh:/app/docker/apply-migrations.sh:ro
+      - ./migrations:/app/migrations:ro
+      # Логирование в файлы отключено для production
+      # - ./logs:/app/logs
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
+      # Уровень логирования: DEBUG, INFO, WARNING, ERROR, CRITICAL
+      # Можно переопределить через LOG_LEVEL_TELEGRAM_BOT или общий LOG_LEVEL
+      - LOG_LEVEL=${LOG_LEVEL_TELEGRAM_BOT:-${LOG_LEVEL:-ERROR}}
+      # Логирование в файлы отключено для production
+      # - LOG_DIR=${LOG_DIR:-/app/logs}
+      - REDIS_ENABLED=true
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - steam-network
+
+  # Parser API - сервис для работы с парсером через Redis
+  parser-api:
+    build:
+      context: .
+      dockerfile: parser_api/Dockerfile
+    container_name: steam-parser-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      # Логирование в файлы отключено для production
+      # - ./logs:/app/logs
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
+      # Уровень логирования: DEBUG, INFO, WARNING, ERROR, CRITICAL
+      # Можно переопределить через LOG_LEVEL_PARSER_API или общий LOG_LEVEL
+      - LOG_LEVEL=${LOG_LEVEL_PARSER_API:-${LOG_LEVEL:-ERROR}}
+      # Логирование в файлы отключено для production
+      # - LOG_DIR=${LOG_DIR:-/app/logs}
+      - REDIS_ENABLED=true
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - steam-network
+    # Порт 8000 скрыт - не нужен вне докера (parser-api используется только внутри сети)
+    # ports:
+    #   - "8000:8000"
+
+  # Parsing Worker - выполнение задач парсинга
+  # Параллельная обработка через корутины (asyncio) в одном контейнере
+  # Использует Redis Streams как брокер сообщений (как Kafka)
+  parsing-worker:
+    build:
+      context: .
+      dockerfile: parsing/Dockerfile
+    container_name: steam-parsing-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      # Логирование в файлы отключено для production
+      # - ./logs:/app/logs
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
+      # Уровень логирования: DEBUG, INFO, WARNING, ERROR, CRITICAL
+      # Можно переопределить через LOG_LEVEL_PARSING_WORKER или общий LOG_LEVEL
+      - LOG_LEVEL=${LOG_LEVEL_PARSING_WORKER:-${LOG_LEVEL:-ERROR}}
+      # Логирование в файлы отключено для production
+      # - LOG_DIR=${LOG_DIR:-/app/logs}
+      - REDIS_ENABLED=true
+      - REDIS_URL=redis://redis:6379/0
+      - ENABLE_MONITORING_SERVICE=${ENABLE_MONITORING_SERVICE:-true}
+      # Максимальное количество одновременных задач (параллелизм через корутины)
+      - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-10}
+      # Задержка между запросами через прокси (секунды)
+      - PROXY_DELAY_DEFAULT=${PROXY_DELAY_DEFAULT:-3.0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      parser-api:
+        condition: service_started
+      telegram-bot:
+        condition: service_started
+    networks:
+      - steam-network
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  steam-network:
+    driver: bridge

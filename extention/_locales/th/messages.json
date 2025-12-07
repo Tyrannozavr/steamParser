@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "เครื่องมือตรวจสอบค่า float ของ CS2 แบบมืออาชีพพร้อมแคชขั้นสูง ผลลัพธ์ทันที และการรวมระบบ Steam อย่างครบถ้วน ดีกว่าคู่แข่ง",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - คลิกเพื่อกำหนดค่า",
+    "description": "Extension title shown on hover"
+  }
+}

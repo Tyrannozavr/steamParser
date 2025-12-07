@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Vérificateur professionnel de valeurs de float CS2 avec mise en cache avancée, résultats instantanés et intégration complète avec Steam. Meilleur que les concurrents.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - Cliquez pour configurer",
+    "description": "Extension title shown on hover"
+  }
+}

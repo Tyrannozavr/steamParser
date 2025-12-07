@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Gelişmiş önbellekleme, anında sonuçlar ve kapsamlı Steam entegrasyonu ile profesyonel CS2 float değer denetleyicisi. Rakiplerden daha iyi.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - Yapılandırmak için tıklayın",
+    "description": "Extension title shown on hover"
+  }
+}

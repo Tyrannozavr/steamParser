@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Professionell CS2 float-värde kontrollant med avancerad cachelagring, omedelbara resultat och omfattande Steam-integration. Bättre än konkurrenterna.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - Klicka för att konfigurera",
+    "description": "Extension title shown on hover"
+  }
+}

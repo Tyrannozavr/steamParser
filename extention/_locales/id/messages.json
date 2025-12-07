@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Pemeriksa nilai float CS2 profesional dengan cache canggih, hasil instan, dan integrasi Steam yang komprehensif. Lebih baik dari pesaing.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - Klik untuk mengkonfigurasi",
+    "description": "Extension title shown on hover"
+  }
+}

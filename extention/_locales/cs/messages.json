@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Profesionální kontrola hodnot float CS2 s pokročilým ukládáním do mezipaměti, okamžitými výsledky a komplexní integrací se Steamem. Lepší než konkurence.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - Klikněte pro konfiguraci",
+    "description": "Extension title shown on hover"
+  }
+}

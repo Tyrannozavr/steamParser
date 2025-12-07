@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "고급 캐싱, 즉각적인 결과, 포괄적인 Steam 통합을 갖춘 전문 CS2 플로트 값 검사기. 경쟁사보다 우수합니다.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - 클릭하여 구성",
+    "description": "Extension title shown on hover"
+  }
+}

@@ -1,0 +1,31 @@
+# Development Dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Установка зависимостей для разработки
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Установка дополнительных инструментов для разработки
+RUN pip install ipython ipdb
+
+# Копирование кода
+COPY . .
+
+# Создание директорий
+RUN mkdir -p /app/data /app/logs
+
+# Переменные окружения для разработки
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV DATABASE_PATH=/app/data/steam_monitor.db
+ENV LOG_DIR=/app/logs
+ENV LOG_LEVEL=DEBUG
+
+# Volume для персистентности и монтирование кода для hot-reload
+VOLUME ["/app/data", "/app/logs", "/app"]
+
+# Запуск с возможностью отладки (бот)
+CMD ["python", "bot_app.py"]
+

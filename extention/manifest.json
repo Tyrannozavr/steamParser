@@ -1,0 +1,70 @@
+{
+"update_url": "https://clients2.google.com/service/update2/crx",
+
+  "manifest_version": 3,
+  "name": "CS2 Float Checker - The Complete Trading Solution",
+  "version": "1.0.1",
+  "description": "Professional CS2 float checker with fade percentages, Doppler phases, investment scoring, and market intelligence",
+  "default_locale": "en",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "64": "icons/icon64.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://steamcommunity.com/*",
+    "https://cs2floatchecker.com/*",
+    "https://api.cs2floatchecker.com/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://api.cs2floatchecker.com https://cs2floatchecker.com http://localhost:3002;"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://steamcommunity.com/market/*",
+        "https://steamcommunity.com/id/*/inventory*",
+        "https://steamcommunity.com/profiles/*/inventory*",
+        "https://steamcommunity.com/tradeoffer/*",
+        "https://steamcommunity.com/id/*/tradehistory",
+        "https://steamcommunity.com/profiles/*/tradehistory"
+      ],
+      "js": ["lib/marketIntelligence.js", "lib/inventoryEnhancer.js", "src/infiniteScroll.js", "src/buff163Integration.js", "src/item3DPreview.js", "src/tradeProtectionDisplay.js", "src/floatRarityDisplay.js", "src/multiMarketPricing.js", "src/feedbackPopup.js", "content.js"],
+      "css": ["styles/main.css", "styles/inventory.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "CS2 Float Checker - The Complete Trading Solution",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "64": "icons/icon64.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icons/*",
+        "styles/*",
+        "floatSorter.js",
+        "lib/page_scripts/*.js",
+        "lib/components/*.js",
+        "lib/services/*.js"
+      ],
+      "matches": ["https://steamcommunity.com/*"]
+    }
+  ]
+}

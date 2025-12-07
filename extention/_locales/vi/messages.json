@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Công cụ kiểm tra giá trị float CS2 chuyên nghiệp với bộ nhớ đệm nâng cao, kết quả tức thì và tích hợp Steam toàn diện. Tốt hơn đối thủ cạnh tranh.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - Nhấp để cấu hình",
+    "description": "Extension title shown on hover"
+  }
+}

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CS2 Float Extension Enhanced</title>
+  <style>
+    body {
+      width: 320px;
+      min-height: 200px;
+      margin: 0;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: #1a1a1a;
+      color: #ffffff;
+    }
+    
+    .header {
+      text-align: center;
+      margin-bottom: 20px;
+      border-bottom: 1px solid #333;
+      padding-bottom: 12px;
+    }
+    
+    .header h2 {
+      margin: 0 0 4px 0;
+      color: #4CAF50;
+      font-size: 18px;
+    }
+    
+    .version {
+      font-size: 12px;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h2>CS2 Float Enhanced</h2>
+    <div class="version">v2.0.0</div>
+  </div>
+
+  <div class="settings-section">
+    <h3>Features</h3>
+
+    <div class="toggle-grid">
+      <div class="toggle-item">
+        <div class="toggle" id="enablePatternAnalysis">
+          <div class="toggle-slider"></div>
+        </div>
+        <label>Pattern Analysis</label>
+      </div>
+
+      <!-- Blue Gem Detection removed - requires proper API support -->
+
+      <div class="toggle-item">
+        <div class="toggle" id="enableMarketIntelligence">
+          <div class="toggle-slider"></div>
+        </div>
+        <label>Market Intelligence</label>
+      </div>
+
+      <div class="toggle-item">
+        <div class="toggle" id="enableVisualFloatBars">
+          <div class="toggle-slider"></div>
+        </div>
+        <label>Visual Float Bars</label>
+      </div>
+
+      <div class="toggle-item">
+        <div class="toggle" id="showPercentileRank">
+          <div class="toggle-slider"></div>
+        </div>
+        <label>Percentile Rank</label>
+      </div>
+    </div>
+
+    <div class="setting-item">
+      <label for="floatPrecision">Float Precision:</label>
+      <div class="slider-container">
+        <input type="range" id="floatPrecision" min="2" max="6" value="4" step="1">
+        <div class="precision-labels">
+          <span>0.00</span>
+          <span>0.000</span>
+          <span>0.0000</span>
+          <span>0.00000</span>
+          <span>0.000000</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="reloadFloats">Reload Floats</button>
+      <button id="clearCache">Clear Cache</button>
+    </div>
+  </div>
+
+  <div class="stats-section">
+    <h3>Statistics</h3>
+    <div class="stats-grid">
+      <div class="stat-item">
+        <span class="stat-value" id="itemsAnalyzed">0</span>
+        <span class="stat-label">Items Analyzed</span>
+      </div>
+      <!-- Blue Gems stat removed - not available -->
+      <div class="stat-item">
+        <span class="stat-value" id="topTierFloatsFound">0</span>
+        <span class="stat-label">Top Tier Floats</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="manual-section">
+    <h3>Manual Check</h3>
+    <div class="manual-input">
+      <input type="text" id="manualInspect" placeholder="Paste inspect link here...">
+      <button id="checkManual">Check</button>
+    </div>
+    <div id="manualResult" style="display: none;"></div>
+  </div>
+
+  <style>
+    .settings-section, .stats-section, .manual-section {
+      margin-top: 20px;
+    }
+
+    .settings-section h3, .stats-section h3, .manual-section h3 {
+      margin: 0 0 15px 0;
+      color: #4CAF50;
+      font-size: 16px;
+      border-bottom: 1px solid #333;
+      padding-bottom: 8px;
+    }
+
+    .toggle-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .toggle-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .toggle {
+      position: relative;
+      width: 40px;
+      height: 20px;
+      background: #333;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background-color 0.3s;
+    }
+
+    .toggle.active {
+      background: #4CAF50;
+    }
+
+    .toggle-slider {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 16px;
+      height: 16px;
+      background: white;
+      border-radius: 50%;
+      transition: transform 0.3s;
+    }
+
+    .toggle.active .toggle-slider {
+      transform: translateX(20px);
+    }
+
+    .toggle-item label {
+      color: #ddd;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+    }
+
+    .stat-item {
+      text-align: center;
+      padding: 8px;
+      background: rgba(76, 175, 80, 0.1);
+      border-radius: 6px;
+      border: 1px solid rgba(76, 175, 80, 0.3);
+    }
+
+    .stat-value {
+      display: block;
+      font-size: 18px;
+      font-weight: bold;
+      color: #4CAF50;
+      margin-bottom: 4px;
+    }
+
+    .stat-label {
+      font-size: 10px;
+      color: #888;
+    }
+
+    .manual-input {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .manual-input input {
+      flex: 1;
+      padding: 8px;
+      background: #333;
+      border: 1px solid #555;
+      border-radius: 4px;
+      color: #ddd;
+      font-size: 12px;
+    }
+
+    .manual-input input::placeholder {
+      color: #888;
+    }
+
+    .manual-input button {
+      padding: 8px 16px;
+      background: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    #manualResult {
+      background: #2a2a2a;
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .setting-item {
+      margin-bottom: 20px;
+    }
+
+    .setting-item label {
+      display: block;
+      margin-bottom: 8px;
+      color: #ddd;
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .slider-container {
+      position: relative;
+    }
+
+    .slider-container input[type="range"] {
+      width: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: #333;
+      outline: none;
+      -webkit-appearance: none;
+    }
+
+    .slider-container input[type="range"]::-webkit-slider-thumb {
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #4CAF50;
+      cursor: pointer;
+      border: 2px solid #fff;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    }
+
+    .slider-container input[type="range"]::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #4CAF50;
+      cursor: pointer;
+      border: 2px solid #fff;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    }
+
+    .precision-labels {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 8px;
+      font-size: 11px;
+      color: #888;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 25px;
+    }
+
+    .actions button {
+      flex: 1;
+      padding: 10px;
+      background: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background-color 0.2s;
+    }
+
+    .actions button:hover {
+      background: #45a049;
+    }
+
+    .actions button:active {
+      transform: translateY(1px);
+    }
+  </style>
+
+  <script src="popup.js"></script>
+</body>
+</html>

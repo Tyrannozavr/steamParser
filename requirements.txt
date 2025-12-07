@@ -1,0 +1,38 @@
+# Основные зависимости для парсинга Steam Market
+httpx>=0.25.0
+pydantic>=2.5.0
+
+# Для обхода блокировок (TLS fingerprint имитация)
+curl-cffi>=0.6.0
+
+# Для будущей работы с Telegram (aiogram)
+aiogram>=3.2.0
+
+# Для парсинга HTML (будет использоваться для извлечения float, паттерна, наклеек)
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# База данных
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0
+
+# Логирование
+loguru>=0.7.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Redis для коммуникации между сервисами
+redis>=5.0.0
+hiredis>=2.2.0
+
+# FastAPI для Parser API сервиса
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Тестирование
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+pytest>=7.4.0
+pytest-asyncio>=0.21.0

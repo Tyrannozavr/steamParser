@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "CS2 Float Checker Pro",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Професійна перевірка значень флоата CS2 з розширеним кешуванням, миттєвими результатами та повною інтеграцією зі Steam. Краще за конкурентів.",
+    "description": "Extension description"
+  },
+  "extensionTitle": {
+    "message": "CS2 Float Checker Pro - Натисніть, щоб налаштувати",
+    "description": "Extension title shown on hover"
+  }
+}
