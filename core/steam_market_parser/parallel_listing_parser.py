@@ -557,34 +557,20 @@ async def parse_listings_parallel(
                                 listing_id=listing_id
                             )
                             
-                            # Проверяем фильтры через process_item_result
-                            if task and db_session:
-                                try:
-                                    from .process_results import process_item_result
-                                    saved = await process_item_result(
-                                        parser=parser,
-                                        task=task,
-                                        parsed_data=parsed_data,
-                                        filters=filters,
-                                        db_session=db_session,
-                                        redis_service=redis_service,
-                                        task_logger=task_logger
-                                    )
-                                    
-                                    if saved:
-                                        page_matching_listings.append(parsed_data)
-                                except Exception as e:
-                                    log("error", f"    ❌ Воркер {worker_id}, страница {page_num}: Ошибка при обработке результата: {e}")
-                            else:
-                                # Fallback: проверка фильтров без сохранения
-                                item_dict = {
-                                    "sell_price_text": f"${listing_price:.2f}",
-                                    "asset_description": {"market_hash_name": hash_name},
-                                    "name": hash_name
-                                }
-                                matches = await parser.filter_service.matches_filters(item_dict, filters, parsed_data)
-                                if matches:
-                                    page_matching_listings.append(parsed_data)
+                            # ВАЖНО: Не вызываем process_item_result из параллельного парсера
+                            # Это вызывает ошибки greenlet_spawn, так как db_session используется из разных воркеров
+                            # Вместо этого просто проверяем фильтры и собираем результаты
+                            # Обработка и сохранение в БД будет выполнено после парсинга всех страниц
+                            
+                            # Проверяем фильтры без сохранения в БД
+                            item_dict = {
+                                "sell_price_text": f"${listing_price:.2f}",
+                                "asset_description": {"market_hash_name": hash_name},
+                                "name": hash_name
+                            }
+                            matches = await parser.filter_service.matches_filters(item_dict, filters, parsed_data)
+                            if matches:
+                                page_matching_listings.append(parsed_data)
                         
                         parse_time = (datetime.now() - parse_start).total_seconds()
                         log("debug", f"    ✅ Воркер {worker_id}, страница {page_num}: Парсинг завершен за {parse_time:.2f}с, найдено {len(page_matching_listings)} подходящих из {len(page_listings)} лотов")
