@@ -649,17 +649,11 @@ class StickerPricesAPI:
                                             logger.debug(f"✅ StickerPricesAPI: Найдена цена в g_rgListingInfo[{key}].lowest_price (число): ${price_str}")
                                             break
                                     
-                                    # Если нет lowest_price, пробуем price (но это цена конкретного листинга, не самая низкая)
-                                    # Используем только если нет lowest_price
-                                    if not price_str:
-                                        price_value = value.get('price')
-                                        if price_value:
-                                            # Цена обычно в центах
-                                            if isinstance(price_value, (int, float)):
-                                                price_in_dollars = price_value / 100
-                                                price_str = str(price_in_dollars)
-                                                logger.debug(f"✅ StickerPricesAPI: Найдена цена в g_rgListingInfo[{key}].price: {price_value} центов = ${price_str}")
-                                                # НЕ break здесь, продолжаем искать lowest_price в других элементах
+                                    # ВАЖНО: НЕ используем price из g_rgListingInfo, так как это цена конкретного листинга,
+                                    # а не самая низкая цена (lowest_price). Это может привести к неправильным ценам.
+                                    # Например, для "Battle Scarred" без префикса может найтись другой предмет с ценой $695.66
+                                    # вместо правильной цены $5.15 для "Sticker | Battle Scarred"
+                                    # Поэтому пропускаем price и ищем только lowest_price
                         except Exception as e:
                             logger.debug(f"⚠️ StickerPricesAPI: Ошибка при парсинге g_rgListingInfo: {e}")
                     
