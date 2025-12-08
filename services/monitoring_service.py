@@ -360,7 +360,7 @@ class MonitoringService:
                             
                             if is_running:
                                 # Проверяем, не зависла ли задача (выполняется слишком долго)
-                                STUCK_TASK_TIMEOUT = 20 * 60  # 20 минут - максимальное время выполнения задачи
+                                STUCK_TASK_TIMEOUT = 10 * 60  # 10 минут - максимальное время выполнения задачи
                                 
                                 if task_start_time:
                                     elapsed_time = (now - task_start_time).total_seconds()

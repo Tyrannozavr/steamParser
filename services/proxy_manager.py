@@ -364,35 +364,38 @@ class ProxyManager:
                 return active_proxies
         
         # Если кэш не доступен или force_refresh, получаем из БД
-        try:
-            # Проверяем состояние сессии и делаем rollback при необходимости
+        # ВАЖНО: get_active_proxies может вызываться из разных мест, включая get_next_proxy, который уже защищен блокировкой
+        # Но для безопасности используем блокировку здесь, так как это публичный метод
+        async with self._lock:
             try:
-                # Пытаемся выполнить простой запрос для проверки состояния сессии
-                await self.db_session.execute(select(1))
-            except Exception:
-                # Если сессия была откачена, делаем rollback
+                # Проверяем состояние сессии и делаем rollback при необходимости
+                try:
+                    # Пытаемся выполнить простой запрос для проверки состояния сессии
+                    await self.db_session.execute(select(1))
+                except Exception:
+                    # Если сессия была откачена, делаем rollback
+                    try:
+                        await self.db_session.rollback()
+                        logger.debug("🔄 ProxyManager: Сессия БД откачена, выполнен rollback")
+                    except Exception:
+                        pass  # Игнорируем ошибки rollback
+                
+                result = await self.db_session.execute(
+                    select(Proxy).where(Proxy.is_active == True).order_by(Proxy.id)
+                )
+                proxies = list(result.scalars().all())
+                logger.info(f"📊 ProxyManager: Получено {len(proxies)} активных прокси из БД (force_refresh={force_refresh})")
+            except Exception as e:
+                logger.error(f"❌ ProxyManager: Ошибка при получении прокси из БД: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                # Пытаемся откатить транзакцию
                 try:
                     await self.db_session.rollback()
-                    logger.debug("🔄 ProxyManager: Сессия БД откачена, выполнен rollback")
                 except Exception:
-                    pass  # Игнорируем ошибки rollback
-            
-            result = await self.db_session.execute(
-                select(Proxy).where(Proxy.is_active == True).order_by(Proxy.id)
-            )
-            proxies = list(result.scalars().all())
-            logger.info(f"📊 ProxyManager: Получено {len(proxies)} активных прокси из БД (force_refresh={force_refresh})")
-        except Exception as e:
-            logger.error(f"❌ ProxyManager: Ошибка при получении прокси из БД: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            # Пытаемся откатить транзакцию
-            try:
-                await self.db_session.rollback()
-            except Exception:
-                pass
-            # Возвращаем пустой список
-            proxies = []
+                    pass
+                # Возвращаем пустой список
+                proxies = []
         
         self._last_proxy_refresh = datetime.now()
         
@@ -519,14 +522,14 @@ class ProxyManager:
         # Fallback на локальный кэш
         return self._last_used.get(proxy_id)
     
-    async def _reserve_proxy(self, proxy_id: int, ttl: int = 300) -> bool:
+    async def _reserve_proxy(self, proxy_id: int, ttl: int = 60) -> bool:
         """
         Атомарно резервирует прокси в Redis (SET NX).
         Предотвращает использование одного прокси несколькими задачами одновременно.
         
         Args:
             proxy_id: ID прокси
-            ttl: Время жизни резервирования в секундах (по умолчанию 5 минут)
+            ttl: Время жизни резервирования в секундах (по умолчанию 1 минута)
             
         Returns:
             True если прокси успешно зарезервирован, False если уже используется
@@ -594,6 +597,9 @@ class ProxyManager:
     async def _set_proxy_last_used_in_db(self, proxy_id: int, timestamp: datetime):
         """
         Сохраняет время последнего использования прокси в БД.
+        
+        ВАЖНО: Этот метод вызывается из mark_proxy_used, который уже защищен блокировкой.
+        Не используем блокировку здесь, чтобы избежать двойной блокировки.
         
         Args:
             proxy_id: ID прокси
@@ -871,16 +877,17 @@ class ProxyManager:
                             logger.info(f"⚡ ProxyManager: Быстрое переключение - выбран прокси ID={proxy.id} (индекс {current_index}, пропущена проверка задержки)")
                             await self._set_last_proxy_index(current_index)
                             return proxy
-                # Если все прокси заняты, берем первый доступный
-                current_index = start_index
-                proxy = proxies[current_index]
-                if await self._reserve_proxy(proxy.id):
-                    logger.info(f"⚡ ProxyManager: Быстрое переключение - выбран прокси ID={proxy.id} (индекс {current_index}, пропущена проверка задержки)")
-                    await self._set_last_proxy_index(current_index)
-                    return proxy
-                else:
-                    logger.warning(f"⚠️ ProxyManager: Не удалось зарезервировать прокси ID={proxy.id} даже при быстром переключении")
-                    return None
+                # Если все прокси заняты, пробуем принудительно взять первый доступный (резервирование могло истечь)
+                for i in range(len(proxies)):
+                    current_index = (start_index + i) % len(proxies)
+                    proxy = proxies[current_index]
+                    # Пробуем зарезервировать даже если занят (резервирование могло истечь)
+                    if await self._reserve_proxy(proxy.id):
+                        logger.info(f"⚡ ProxyManager: Быстрое переключение - принудительно выбран прокси ID={proxy.id} (индекс {current_index}, пропущена проверка задержки)")
+                        await self._set_last_proxy_index(current_index)
+                        return proxy
+                logger.warning(f"⚠️ ProxyManager: Не удалось зарезервировать ни один прокси из {len(proxies)} доступных")
+                return None
             
             # Если precheck=True, предварительно проверяем несколько прокси параллельно
             if precheck and len(proxies) > 1:

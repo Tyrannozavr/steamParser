@@ -14,6 +14,7 @@ from ..models import ParsedItemData, SearchFilters
 from services.redis_service import RedisService
 from services.filter_service import FilterService
 from ..logger import get_task_logger
+from core import MonitoringTask
 
 
 async def process_item_result(
@@ -25,6 +26,17 @@ async def process_item_result(
     redis_service: Optional[RedisService] = None,
     task_logger=None
 ) -> bool:
+    # ВАЖНО: Если task был загружен в другой сессии, загружаем его заново в текущей сессии
+    # Это предотвращает ошибку "Instance is not persistent within this Session"
+    if task and hasattr(task, 'id'):
+        try:
+            # Пытаемся загрузить task в текущей сессии
+            task = await db_session.get(MonitoringTask, task.id)
+            if not task:
+                logger.error(f"❌ Задача {task.id if hasattr(task, 'id') else 'unknown'} не найдена в БД")
+                return False
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось загрузить task в текущей сессии: {e}, используем переданный объект")
     """
     Обрабатывает результат парсинга одного предмета:
     1. Проверяет фильтры

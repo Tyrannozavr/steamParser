@@ -229,7 +229,7 @@ class ParsingWorker:
                         logger.warning(f"   🔍 Проверяем, действительно ли задача выполняется другим воркером или это зависший флаг...")
                         
                         # Проверяем время начала выполнения для обнаружения зависших задач
-                        STUCK_TASK_TIMEOUT = 20 * 60  # 20 минут - максимальное время выполнения задачи
+                        STUCK_TASK_TIMEOUT = 10 * 60  # 10 минут - максимальное время выполнения задачи
                         try:
                             if self.redis_service and self.redis_service.is_connected() and self.redis_service._client:
                                 flag_value = await self.redis_service._client.get(task_running_key)
@@ -442,7 +442,8 @@ class ParsingWorker:
                         count=10,
                         task=task,
                         db_session=task_db_session,
-                        redis_service=self.redis_service
+                        redis_service=self.redis_service,
+                        db_manager=self.db_manager
                     )
                     logger.info(f"✅ ParsingWorker: [КРИТИЧЕСКИЙ ШАГ] parsing_service.parse_items() завершен для задачи {task_id}")
                 except Exception as e:
@@ -529,24 +530,32 @@ class ParsingWorker:
                     task_logger.info(f"⏰ Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Обрабатываем результаты парсинга через универсальный сервис
+                # ВАЖНО: Если результаты уже обработаны в параллельном парсере (сразу после нахождения),
+                # то items_list будет пустым, и ResultsProcessorService не будет вызываться
+                # Это предотвращает повторную публикацию уведомлений
                 found_count = 0
                 if result.get('success') and result.get('items'):
                     items_list = result.get('items', [])
                     logger.info(f"📦 ParsingWorker: Получено {len(items_list)} предметов для обработки")
                     task_logger.info(f"📦 Получено {len(items_list)} предметов для обработки")
                     
-                    # Используем ResultsProcessorService для обработки результатов
-                    results_processor = ResultsProcessorService(
-                        db_session=task_db_session,
-                        redis_service=self.redis_service
-                    )
-                    
-                    found_count = await results_processor.process_results(
-                        task=task,
-                        items=items_list,
-                        task_logger=task_logger
-                    )
-                    # results_processor.process_results уже делает commit, который сохранит все изменения задачи
+                    if len(items_list) > 0:
+                        # Используем ResultsProcessorService только если есть необработанные результаты
+                        # Если результаты уже обработаны в параллельном парсере, items_list будет пустым
+                        results_processor = ResultsProcessorService(
+                            db_session=task_db_session,
+                            redis_service=self.redis_service
+                        )
+                        
+                        found_count = await results_processor.process_results(
+                            task=task,
+                            items=items_list,
+                            task_logger=task_logger
+                        )
+                        # results_processor.process_results уже делает commit, который сохранит все изменения задачи
+                    else:
+                        logger.info(f"ℹ️ ParsingWorker: Список предметов пуст - результаты уже обработаны в параллельном парсере (уведомления отправлены сразу)")
+                        task_logger.info(f"ℹ️ Результаты уже обработаны, уведомления отправлены сразу")
                 else:
                     if not result.get('success'):
                         logger.warning(f"⚠️ Парсинг неуспешен для задачи {task_id}: {result.get('error', 'Unknown error')}")

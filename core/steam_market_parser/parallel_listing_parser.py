@@ -27,7 +27,8 @@ async def parse_listings_parallel(
     task_logger=None,
     task=None,
     db_session=None,
-    redis_service=None
+    redis_service=None,
+    db_manager=None
 ) -> List[ParsedItemData]:
     """
     Параллельный парсинг всех страниц лотов с использованием Redis очереди.
@@ -288,6 +289,22 @@ async def parse_listings_parallel(
                 
                 log("info", f"    📄 Воркер {worker_id}: Начал обработку страницы {page_num}/{total_pages} (start={page_start}, count={page_count})")
                 
+                # Heartbeat для отслеживания зависших воркеров
+                heartbeat_task = None
+                # Сохраняем page_num в локальную переменную для heartbeat
+                current_page_num = page_num
+                async def heartbeat():
+                    while True:
+                        await asyncio.sleep(30)  # Каждые 30 секунд
+                        elapsed = (datetime.now() - task_start_time).total_seconds()
+                        current_stage = task_stages.get(current_page_num, "неизвестно")
+                        log("warning", f"    💓 Воркер {worker_id}, страница {current_page_num}: HEARTBEAT - еще работает (этап: '{current_stage}', прошло {elapsed:.1f}с)")
+                
+                try:
+                    heartbeat_task = asyncio.create_task(heartbeat())
+                except Exception as hb_error:
+                    log("warning", f"    ⚠️ Воркер {worker_id}, страница {page_num}: Не удалось создать heartbeat: {hb_error}")
+                
                 # Обрабатываем страницу с retry
                 for attempt in range(max_retries):
                     page_proxy = None
@@ -343,15 +360,23 @@ async def parse_listings_parallel(
                         # Этап 4: Выполнение запроса
                         request_start = datetime.now()
                         task_stages[page_num] = f"выполнение_запроса (прокси {page_proxy.id}, start={page_start}, попытка {attempt + 1})"
-                        log("debug", f"    📡 Воркер {worker_id}, страница {page_num}: Отправляем запрос через прокси ID={page_proxy.id} (start={page_start}, count={page_count})...")
+                        log("info", f"    📡 Воркер {worker_id}, страница {page_num}: Отправляем запрос через прокси ID={page_proxy.id} (start={page_start}, count={page_count})...")
                         
-                        render_data = await asyncio.wait_for(
-                            temp_parser._fetch_render_api(appid, hash_name, start=page_start, count=page_count),
-                            timeout=60.0
-                        )
-                        
-                        request_time = (datetime.now() - request_start).total_seconds()
-                        log("debug", f"    ✅ Воркер {worker_id}, страница {page_num}: Запрос выполнен за {request_time:.2f}с")
+                        try:
+                            render_data = await asyncio.wait_for(
+                                temp_parser._fetch_render_api(appid, hash_name, start=page_start, count=page_count),
+                                timeout=60.0
+                            )
+                            request_time = (datetime.now() - request_start).total_seconds()
+                            log("info", f"    ✅ Воркер {worker_id}, страница {page_num}: Запрос выполнен за {request_time:.2f}с")
+                        except asyncio.TimeoutError:
+                            request_time = (datetime.now() - request_start).total_seconds()
+                            log("error", f"    ❌ Воркер {worker_id}, страница {page_num}: ТАЙМАУТ запроса после {request_time:.2f}с на этапе 'выполнение_запроса'")
+                            raise
+                        except Exception as req_error:
+                            request_time = (datetime.now() - request_start).total_seconds()
+                            log("error", f"    ❌ Воркер {worker_id}, страница {page_num}: ОШИБКА запроса после {request_time:.2f}с: {type(req_error).__name__}: {req_error}")
+                            raise
                         
                         if render_data is None:
                             log("warning", f"    ⚠️ Воркер {worker_id}, страница {page_num}: Прокси ID={page_proxy.id} не вернул данные (попытка {attempt + 1}/{max_retries})")
@@ -367,7 +392,7 @@ async def parse_listings_parallel(
                         # Этап 5: Парсинг данных
                         parse_start = datetime.now()
                         task_stages[page_num] = f"парсинг_данных (прокси {page_proxy.id}, попытка {attempt + 1})"
-                        log("debug", f"    🔍 Воркер {worker_id}, страница {page_num}: Начинаем парсинг данных...")
+                        log("info", f"    🔍 Воркер {worker_id}, страница {page_num}: Начинаем парсинг данных...")
                         
                         page_matching_listings = []
                         
@@ -557,10 +582,16 @@ async def parse_listings_parallel(
                                 listing_id=listing_id
                             )
                             
-                            # ВАЖНО: Не вызываем process_item_result из параллельного парсера
-                            # Это вызывает ошибки greenlet_spawn, так как db_session используется из разных воркеров
-                            # Вместо этого просто проверяем фильтры и собираем результаты
-                            # Обработка и сохранение в БД будет выполнено после парсинга всех страниц
+                            # РАННЯЯ ПРОВЕРКА ПАТТЕРНА: если паттерн известен и не подходит - пропускаем сразу
+                            # Это предотвращает обработку предметов, которые точно не пройдут фильтры
+                            if listing_pattern is not None and filters.pattern_list:
+                                target_patterns = filters.pattern_list.patterns if filters.pattern_list else []
+                                if target_patterns:
+                                    # Нормализуем паттерн (для keychain берем остаток от деления на 1000)
+                                    normalized_pattern = listing_pattern % 1000 if listing_pattern > 999 else listing_pattern
+                                    if normalized_pattern not in target_patterns:
+                                        log("debug", f"    ⏭️ Воркер {worker_id}, страница {page_num}: Пропускаем предмет с паттерном {listing_pattern} (нормализован: {normalized_pattern}), не в списке {target_patterns}")
+                                        continue
                             
                             # Проверяем фильтры без сохранения в БД
                             item_dict = {
@@ -570,7 +601,52 @@ async def parse_listings_parallel(
                             }
                             matches = await parser.filter_service.matches_filters(item_dict, filters, parsed_data)
                             if matches:
-                                page_matching_listings.append(parsed_data)
+                                # ВАЖНО: Обрабатываем результат СРАЗУ после нахождения, а не после всех страниц
+                                # Это гарантирует, что уведомления отправляются немедленно
+                                if task and db_manager:
+                                    log("info", f"    🔄 Воркер {worker_id}: Найден подходящий предмет, обрабатываем СРАЗУ (task={task.id}, db_manager={db_manager is not None})")
+                                    try:
+                                        # Создаем отдельную сессию БД для этого воркера
+                                        worker_db_session = await db_manager.get_session()
+                                        try:
+                                            from .process_results import process_item_result
+                                            
+                                            log("info", f"    📝 Воркер {worker_id}: Вызываем process_item_result для немедленной обработки...")
+                                            # Обрабатываем результат сразу (сохранение в БД + отправка уведомления)
+                                            saved = await process_item_result(
+                                                parser=parser,
+                                                task=task,
+                                                parsed_data=parsed_data,
+                                                filters=filters,
+                                                db_session=worker_db_session,
+                                                redis_service=redis_service,
+                                                task_logger=task_logger
+                                            )
+                                            
+                                            if saved:
+                                                log("info", f"    │ ✅✅✅ ВСЕ ФИЛЬТРЫ ПРОЙДЕНЫ И ПРЕДМЕТ СОХРАНЕН СРАЗУ!")
+                                                log("info", f"    └────────────────────────────────────────────────────────────────────")
+                                                # ВАЖНО: НЕ добавляем в page_matching_listings, если результат уже обработан
+                                                # Это предотвратит повторную обработку через ResultsProcessorService
+                                                # Уведомление уже отправлено в process_item_result
+                                                log("info", f"    ℹ️ Предмет уже обработан и уведомление отправлено, не добавляем в список для повторной обработки")
+                                            else:
+                                                log("info", f"    │ ❌ НЕ ПРОШЕЛ ФИЛЬТРЫ ИЛИ УЖЕ СУЩЕСТВУЕТ В БД")
+                                                log("info", f"    └────────────────────────────────────────────────────────────────────")
+                                        finally:
+                                            # Закрываем сессию воркера
+                                            await worker_db_session.close()
+                                    except Exception as process_error:
+                                        error_msg = str(process_error)[:200]
+                                        log("error", f"    ⚠️ Ошибка при обработке результата: {type(process_error).__name__}: {error_msg}")
+                                        import traceback
+                                        log("error", f"    Traceback: {traceback.format_exc()}")
+                                        # В случае ошибки все равно добавляем в список для совместимости
+                                        page_matching_listings.append(parsed_data)
+                                else:
+                                    # Если нет task или db_manager, просто добавляем в список (старая логика)
+                                    log("warning", f"    ⚠️ Воркер {worker_id}: Нет task или db_manager (task={task is not None}, db_manager={db_manager is not None}), используем старую логику")
+                                    page_matching_listings.append(parsed_data)
                         
                         parse_time = (datetime.now() - parse_start).total_seconds()
                         log("debug", f"    ✅ Воркер {worker_id}, страница {page_num}: Парсинг завершен за {parse_time:.2f}с, найдено {len(page_matching_listings)} подходящих из {len(page_listings)} лотов")
@@ -606,6 +682,12 @@ async def parse_listings_parallel(
                         break
                         
                     except asyncio.TimeoutError:
+                        if heartbeat_task:
+                            heartbeat_task.cancel()
+                            try:
+                                await heartbeat_task
+                            except asyncio.CancelledError:
+                                pass
                         timeout_time = (datetime.now() - task_start_time).total_seconds()
                         current_stage = task_stages.get(page_num, "неизвестно")
                         log("error", f"    ⏱️ Воркер {worker_id}, страница {page_num}: ТАЙМАУТ запроса (60с) на этапе '{current_stage}' после {timeout_time:.2f}с работы (попытка {attempt + 1}/{max_retries})")
@@ -629,9 +711,18 @@ async def parse_listings_parallel(
                                 del task_stages[page_num]
                             break
                     except Exception as e:
+                        if heartbeat_task:
+                            heartbeat_task.cancel()
+                            try:
+                                await heartbeat_task
+                            except asyncio.CancelledError:
+                                pass
                         error_msg = str(e)[:200]
                         current_stage = task_stages.get(page_num, "неизвестно")
-                        log("error", f"    ❌ Воркер {worker_id}, страница {page_num}: ОШИБКА на этапе '{current_stage}': {type(e).__name__}: {error_msg} (попытка {attempt + 1}/{max_retries})")
+                        error_time = (datetime.now() - task_start_time).total_seconds()
+                        log("error", f"    ❌ Воркер {worker_id}, страница {page_num}: ОШИБКА на этапе '{current_stage}' после {error_time:.2f}с: {type(e).__name__}: {error_msg} (попытка {attempt + 1}/{max_retries})")
+                        import traceback
+                        log("error", f"    📋 Traceback: {traceback.format_exc()[:500]}")
                         
                         if attempt < max_retries - 1:
                             log("warning", f"    ⚠️ Воркер {worker_id}, страница {page_num}: Ошибка, повторяем с другим прокси...")
@@ -720,10 +811,14 @@ async def parse_listings_parallel(
                 log("error", f"   📋 Страница {page_num}: зависла на этапе '{stage}' уже {elapsed:.1f}с")
     
     # Собираем результаты в правильном порядке
+    # ВАЖНО: Если результаты уже обработаны в параллельном парсере (сразу после нахождения),
+    # то page_matching_listings будет пустым, и мы не вернем их для повторной обработки
     for page_matching_listings in results:
         if page_matching_listings:
             matching_listings.extend(page_matching_listings)
     
     log("info", f"📊 Параллельный парсинг завершен: проверено {completed_pages}/{len(pages_to_fetch)} страниц, найдено {len(matching_listings)} подходящих лотов")
+    if len(matching_listings) == 0:
+        log("info", f"ℹ️ Список результатов пуст - все найденные предметы уже обработаны сразу (уведомления отправлены)")
     
     return matching_listings

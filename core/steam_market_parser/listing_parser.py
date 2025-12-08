@@ -155,10 +155,14 @@ class ListingParser:
         # Если есть total_count и достаточно прокси - используем параллельный парсинг
         if use_parallel and total_count and total_count > listings_per_page:
             from .parallel_listing_parser import parse_listings_parallel
+            # Получаем db_manager из parser, если доступен
+            db_manager = getattr(parser, 'db_manager', None)
+            if task_logger:
+                task_logger.info(f"🔍 ListingParser: Используем параллельный парсинг (task={task.id if task else None}, db_manager={db_manager is not None})")
             matching_listings = await parse_listings_parallel(
                 parser, appid, hash_name, filters, target_patterns,
                 listings_per_page, total_count, active_proxies_count,
-                task_logger, task, db_session, redis_service
+                task_logger, task, db_session, redis_service, db_manager
             )
             return matching_listings
         

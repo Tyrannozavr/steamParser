@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""
+Скрипт для полного удаления и пересоздания задачи 29
+"""
+import asyncio
+import sys
+from pathlib import Path
+from datetime import datetime
+
+# Добавляем корневую директорию в путь
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from loguru import logger
+from core.database import DatabaseManager
+from services.redis_service import RedisService
+from services.proxy_manager_factory import ProxyManagerFactory
+from services.monitoring_service import MonitoringService
+from core.config import Config
+from sqlalchemy import text, select
+from core import MonitoringTask, FoundItem, SearchFilters, PatternList, StickersFilter
+
+
+async def main():
+    """Удаляет все данные задачи 29 и пересоздает её."""
+    item_name = "MP9 | Starlight Protector (Field-Tested)"
+    patterns = [14, 18, 461, 513, 173, 867, 456, 359, 232]
+    max_price = 120.0
+    
+    logger.info(f"🗑️  Полное удаление и пересоздание задачи для '{item_name}'...")
+    
+    # Инициализация БД
+    db_manager = DatabaseManager(Config.DATABASE_URL)
+    await db_manager.init_db()
+    session = await db_manager.get_session()
+    
+    # Инициализация Redis
+    redis_service = None
+    if Config.REDIS_ENABLED:
+        redis_service = RedisService(redis_url=Config.REDIS_URL)
+        await redis_service.connect()
+        logger.info("✅ Redis подключен")
+    
+    # Инициализация ProxyManager через фабрику
+    proxy_manager = await ProxyManagerFactory.get_instance(
+        db_session=session,
+        redis_service=redis_service,
+        default_delay=0.2,
+        site="steam"
+    )
+    
+    # Инициализация MonitoringService
+    monitoring_service = MonitoringService(
+        db_session=session,
+        proxy_manager=proxy_manager,
+        redis_service=redis_service
+    )
+    
+    try:
+        # Удаляем все найденные предметы для этого item_name
+        logger.info(f"🗑️  Удаляем ВСЕ найденные предметы для '{item_name}'...")
+        delete_result = await session.execute(
+            text("DELETE FROM found_items WHERE item_name = :item_name"),
+            {"item_name": item_name}
+        )
+        deleted_count = delete_result.rowcount
+        logger.info(f"✅ Удалено {deleted_count} найденных предметов")
+        
+        # Находим и удаляем все задачи для этого предмета
+        result = await session.execute(
+            select(MonitoringTask).where(MonitoringTask.item_name == item_name)
+        )
+        tasks = result.scalars().all()
+        
+        if tasks:
+            for task in tasks:
+                logger.info(f"🗑️  Удаляем задачу {task.id}...")
+                await monitoring_service.delete_monitoring_task(task.id)
+                logger.info(f"✅ Задача {task.id} удалена")
+        
+        await session.commit()
+        
+        # Создаем новую задачу
+        logger.info(f"📝 Создаем новую задачу для '{item_name}'...")
+        
+        filters = SearchFilters(
+            item_name=item_name,
+            appid=730,
+            currency=1,
+            max_price=max_price,
+            pattern_list=PatternList(
+                patterns=patterns,
+                item_type="skin"
+            ),
+            stickers_filter=StickersFilter(
+                min_stickers_price=0.0,
+                max_overpay_coefficient=None
+            )
+        )
+        
+        new_task = await monitoring_service.add_monitoring_task(
+            name=item_name,
+            item_name=item_name,
+            filters=filters,
+            check_interval=60  # 1 минута для быстрого теста
+        )
+        
+        if new_task:
+            logger.info(f"✅ Новая задача создана: ID={new_task.id}, Название: {new_task.name}")
+            logger.info(f"   📋 Параметры: appid=730, currency=1, check_interval=60с")
+            logger.info(f"   🔍 Фильтры: max_price=${max_price}, pattern={patterns}")
+            
+            # Сбрасываем next_check для немедленного запуска
+            new_task.next_check = datetime.now()
+            await session.commit()
+            logger.info(f"   ⏰ next_check установлен на текущее время для немедленного запуска")
+            
+            # Публикуем задачу в Redis очередь для немедленного выполнения
+            if redis_service and redis_service.is_connected():
+                try:
+                    queue_key = "parsing_tasks"
+                    task_message = {
+                        "task_id": new_task.id,
+                        "action": "parse"
+                    }
+                    await redis_service.push_to_queue(queue_key, task_message)
+                    logger.info(f"   📤 Задача добавлена в Redis очередь для немедленного выполнения")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Не удалось добавить задачу в очередь: {e}")
+        else:
+            logger.error("❌ Не удалось создать новую задачу")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+    finally:
+        await session.close()
+        if redis_service:
+            await redis_service.disconnect()
+        await db_manager.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+

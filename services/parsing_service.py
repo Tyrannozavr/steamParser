@@ -44,7 +44,8 @@ class ParsingService:
         count: int = 20,
         task = None,
         db_session = None,
-        redis_service = None
+        redis_service = None,
+        db_manager = None
     ) -> Dict[str, Any]:
         """
         Парсит предметы на Steam Market согласно фильтрам.
@@ -132,6 +133,9 @@ class ParsingService:
             logger.info(f"🔧 ParsingService: [ШАГ 3/4] Инициализируем парсер (proxy={proxy_url[:50] if proxy_url else 'None'}...)...")
             try:
                 async with SteamMarketParser(proxy=proxy_url, timeout=30, redis_service=self.redis_service, proxy_manager=self.proxy_manager) as parser:
+                    # Устанавливаем db_manager в parser для доступа в параллельном парсере
+                    if db_manager:
+                        parser.db_manager = db_manager
                     logger.info(f"✅ ParsingService: [ШАГ 3/4] Парсер инициализирован успешно")
                     # Выполняем поиск
                     logger.info(f"🔍 ParsingService: [ШАГ 4/4] Выполняем поиск через SteamMarketParser.search_items()...")
