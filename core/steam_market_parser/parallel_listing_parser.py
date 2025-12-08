@@ -675,6 +675,13 @@ async def parse_listings_parallel(
                         
                         # Успешно обработали страницу, выходим из цикла retry
                         task_stages[page_num] = "завершено"
+                        # Отменяем heartbeat, так как страница обработана
+                        if heartbeat_task:
+                            heartbeat_task.cancel()
+                            try:
+                                await heartbeat_task
+                            except asyncio.CancelledError:
+                                pass
                         if page_num in task_start_times:
                             del task_start_times[page_num]
                         if page_num in task_stages:
@@ -745,6 +752,13 @@ async def parse_listings_parallel(
                                 del task_stages[page_num]
                             break
                     finally:
+                        # Отменяем heartbeat при выходе из цикла retry
+                        if heartbeat_task:
+                            heartbeat_task.cancel()
+                            try:
+                                await heartbeat_task
+                            except asyncio.CancelledError:
+                                pass
                         # Закрываем клиенты
                         if temp_parser:
                             try:
@@ -762,6 +776,13 @@ async def parse_listings_parallel(
                 log("error", f"    ❌ Воркер {worker_id}: КРИТИЧЕСКАЯ ОШИБКА при обработке страницы: {type(e).__name__}: {error_msg}")
                 import traceback
                 log("error", f"    📋 Traceback: {traceback.format_exc()}")
+                # Отменяем heartbeat при критической ошибке
+                if 'heartbeat_task' in locals() and heartbeat_task:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
                 if page_num:
                     async with lock:
                         completed_pages += 1
