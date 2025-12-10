@@ -1581,8 +1581,9 @@ class SteamMarketParser(SteamAPIMethods, SteamHelperMethods):
                 available_proxies = await self.proxy_manager.get_active_proxies(force_refresh=False)
                 
                 if not available_proxies:
-                    log_both("warning", f"    ⚠️ Страница {page_num}: Нет доступных прокси, пробуем обновить список")
-                    available_proxies = await self.proxy_manager.get_active_proxies(force_refresh=True)
+                    log_both("warning", f"    ⚠️ Страница {page_num}: Нет доступных прокси, пробуем получить из кэша")
+                    # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                    available_proxies = await self.proxy_manager.get_active_proxies(force_refresh=False)
                 
                 # Максимум попыток = количество доступных прокси (проверяем все)
                 max_proxy_attempts = len(available_proxies) if available_proxies else 20
@@ -1600,7 +1601,8 @@ class SteamMarketParser(SteamAPIMethods, SteamHelperMethods):
                     else:
                         # Если нет доступных прокси, пробуем получить через get_next_proxy с предварительной проверкой
                         log_both("info", f"    🔄 Страница {page_num}: Попытка {attempt + 1} - получаем прокси через get_next_proxy (precheck={attempt == 0})...")
-                        page_proxy = await self.proxy_manager.get_next_proxy(force_refresh=(attempt == 0), precheck=(attempt == 0))
+                        # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                        page_proxy = await self.proxy_manager.get_next_proxy(force_refresh=False, precheck=(attempt == 0))
                         if not page_proxy:
                             log_both("warning", f"    ⚠️ Страница {page_num}: Попытка {attempt + 1} - не удалось получить прокси")
                             if attempt < max_proxy_attempts - 1:

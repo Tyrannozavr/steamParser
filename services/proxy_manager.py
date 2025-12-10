@@ -58,6 +58,7 @@ class ProxyManager:
         self._last_used: Dict[int, datetime] = {}  # Локальный кэш (fallback если Redis недоступен)
         self._blocked_proxies: Dict[int, datetime] = {}  # Локальный кэш заблокированных прокси
         self._lock = asyncio.Lock()  # Блокировка для потокобезопасности
+        self._db_lock = asyncio.Lock()  # Отдельная блокировка для операций с БД (избегает deadlock при вложенных вызовах)
         self._last_proxy_refresh: Optional[datetime] = None  # Время последнего обновления списка прокси
         self._proxy_refresh_interval = timedelta(minutes=5)  # Интервал обновления списка прокси
         self._background_check_task: Optional[asyncio.Task] = None  # Фоновая задача проверки прокси
@@ -122,7 +123,8 @@ class ProxyManager:
         Returns:
             Созданный или существующий объект Proxy
         """
-        async with self._lock:
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
             # Нормализуем URL для проверки уникальности
             normalized_url = ProxyManager._normalize_proxy_url(url)
             
@@ -196,54 +198,47 @@ class ProxyManager:
             logger.debug("⚠️ ProxyManager: Redis не подключен, пропускаем кэширование")
             return
         
-        try:
-            # Получаем актуальный список из БД
-            # ВАЖНО: Проверяем состояние сессии перед выполнением запроса
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
             try:
-                # Пытаемся выполнить простой запрос для проверки состояния сессии
-                await self.db_session.execute(select(1))
-            except Exception:
-                # Если сессия была откачена, делаем rollback
-                try:
-                    await self.db_session.rollback()
-                    logger.debug("🔄 ProxyManager: Сессия БД откачена в _update_redis_cache, выполнен rollback")
-                except Exception:
-                    pass  # Игнорируем ошибки rollback
-            
-            result = await self.db_session.execute(
-                select(Proxy).where(Proxy.is_active == True).order_by(Proxy.id)
-            )
-            proxies = list(result.scalars().all())
-            
-            # Сериализуем данные прокси
-            proxies_data = [
-                {
-                    "id": p.id,
-                    "url": p.url,
-                    "is_active": p.is_active,
-                    "delay_seconds": p.delay_seconds,
-                    "success_count": p.success_count,
-                    "fail_count": p.fail_count,
-                    "last_used": p.last_used.isoformat() if p.last_used else None,
-                    "last_error": p.last_error
-                }
-                for p in proxies
-            ]
-            
-            # Сохраняем в Redis
-            if self.redis_service._client:
-                await self.redis_service._client.setex(
-                    self.REDIS_CACHE_KEY,
-                    self.REDIS_CACHE_TTL,
-                    json.dumps(proxies_data, ensure_ascii=False)
+                # Получаем актуальный список из БД
+                # ВАЖНО: Убрана проверка select(1) - она может вызывать конфликты при одновременных вызовах
+                # Если сессия в плохом состоянии, основной запрос сам вызовет ошибку, которую мы обработаем
+                
+                result = await self.db_session.execute(
+                    select(Proxy).where(Proxy.is_active == True).order_by(Proxy.id)
                 )
-                logger.debug(f"💾 ProxyManager: Обновлен кэш в Redis ({len(proxies_data)} прокси)")
-            else:
-                logger.warning("⚠️ ProxyManager: Redis client не доступен")
-        except Exception as e:
-            logger.warning(f"⚠️ ProxyManager: Не удалось обновить кэш в Redis: {e}")
-            import traceback
-            logger.debug(f"Traceback: {traceback.format_exc()}")
+                proxies = list(result.scalars().all())
+                
+                # Сериализуем данные прокси
+                proxies_data = [
+                    {
+                        "id": p.id,
+                        "url": p.url,
+                        "is_active": p.is_active,
+                        "delay_seconds": p.delay_seconds,
+                        "success_count": p.success_count,
+                        "fail_count": p.fail_count,
+                        "last_used": p.last_used.isoformat() if p.last_used else None,
+                        "last_error": p.last_error
+                    }
+                    for p in proxies
+                ]
+                
+                # Сохраняем в Redis
+                if self.redis_service._client:
+                    await self.redis_service._client.setex(
+                        self.REDIS_CACHE_KEY,
+                        self.REDIS_CACHE_TTL,
+                        json.dumps(proxies_data, ensure_ascii=False)
+                    )
+                    logger.debug(f"💾 ProxyManager: Обновлен кэш в Redis ({len(proxies_data)} прокси)")
+                else:
+                    logger.warning("⚠️ ProxyManager: Redis client не доступен")
+            except Exception as e:
+                logger.warning(f"⚠️ ProxyManager: Не удалось обновить кэш в Redis: {e}")
+                import traceback
+                logger.debug(f"Traceback: {traceback.format_exc()}")
     
     async def get_active_proxies(self, force_refresh: bool = False) -> List[Proxy]:
         """
@@ -363,28 +358,49 @@ class ProxyManager:
                 
                 return active_proxies
         
-        # Если кэш не доступен или force_refresh, получаем из БД
-        # ВАЖНО: get_active_proxies может вызываться из разных мест, включая get_next_proxy, который уже защищен блокировкой
-        # Но для безопасности используем блокировку здесь, так как это публичный метод
-        async with self._lock:
+        # Если кэш не доступен или нужно обновить из БД, получаем из БД
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        # ВАЖНО: Обращаемся к БД только при необходимости, не при каждом вызове
+        async with self._db_lock:
             try:
-                # Проверяем состояние сессии и делаем rollback при необходимости
-                try:
-                    # Пытаемся выполнить простой запрос для проверки состояния сессии
-                    await self.db_session.execute(select(1))
-                except Exception:
-                    # Если сессия была откачена, делаем rollback
-                    try:
-                        await self.db_session.rollback()
-                        logger.debug("🔄 ProxyManager: Сессия БД откачена, выполнен rollback")
-                    except Exception:
-                        pass  # Игнорируем ошибки rollback
+                # ВАЖНО: Убрана проверка select(1) - она может вызывать конфликты при одновременных вызовах
+                # Если сессия в плохом состоянии, основной запрос сам вызовет ошибку, которую мы обработаем
                 
                 result = await self.db_session.execute(
                     select(Proxy).where(Proxy.is_active == True).order_by(Proxy.id)
                 )
                 proxies = list(result.scalars().all())
                 logger.info(f"📊 ProxyManager: Получено {len(proxies)} активных прокси из БД (force_refresh={force_refresh})")
+                
+                # ВАЖНО: Обновляем кэш в Redis ВНУТРИ блока _db_lock, используя те же данные
+                # Это избегает повторного запроса к БД и гарантирует атомарность операции
+                try:
+                    # Сериализуем данные прокси
+                    import json
+                    proxies_data = [
+                        {
+                            "id": p.id,
+                            "url": p.url,
+                            "is_active": p.is_active,
+                            "delay_seconds": p.delay_seconds,
+                            "success_count": p.success_count,
+                            "fail_count": p.fail_count,
+                            "last_used": p.last_used.isoformat() if p.last_used else None,
+                            "last_error": p.last_error
+                        }
+                        for p in proxies
+                    ]
+                    
+                    # Сохраняем в Redis (без повторного запроса к БД)
+                    if self.redis_service and self.redis_service._client:
+                        await self.redis_service._client.setex(
+                            self.REDIS_CACHE_KEY,
+                            self.REDIS_CACHE_TTL,
+                            json.dumps(proxies_data, ensure_ascii=False)
+                        )
+                        logger.debug(f"💾 ProxyManager: Обновлен кэш в Redis ({len(proxies_data)} прокси) из get_active_proxies")
+                except Exception as cache_error:
+                    logger.warning(f"⚠️ ProxyManager: Не удалось обновить кэш в Redis из get_active_proxies: {cache_error}")
             except Exception as e:
                 logger.error(f"❌ ProxyManager: Ошибка при получении прокси из БД: {e}")
                 import traceback
@@ -398,9 +414,6 @@ class ProxyManager:
                 proxies = []
         
         self._last_proxy_refresh = datetime.now()
-        
-        # Обновляем кэш в Redis
-        await self._update_redis_cache()
         
         # ВАЖНО: Исключаем временно заблокированные прокси из списка активных
         # НО: Если Redis недоступен или есть ошибки, НЕ исключаем прокси (чтобы не блокировать рабочие прокси)
@@ -504,20 +517,22 @@ class ProxyManager:
         if proxy_id in self._last_used:
             return self._last_used[proxy_id]
         
-        try:
-            # Получаем прокси из БД
-            from core import Proxy
-            result = await self.db_session.execute(
-                select(Proxy).where(Proxy.id == proxy_id)
-            )
-            proxy = result.scalar_one_or_none()
-            
-            if proxy and proxy.last_used:
-                # Обновляем локальный кэш
-                self._last_used[proxy_id] = proxy.last_used
-                return proxy.last_used
-        except Exception as e:
-            logger.debug(f"⚠️ ProxyManager: Ошибка при получении времени использования прокси {proxy_id} из БД: {e}")
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
+            try:
+                # Получаем прокси из БД
+                from core import Proxy
+                result = await self.db_session.execute(
+                    select(Proxy).where(Proxy.id == proxy_id)
+                )
+                proxy = result.scalar_one_or_none()
+                
+                if proxy and proxy.last_used:
+                    # Обновляем локальный кэш
+                    self._last_used[proxy_id] = proxy.last_used
+                    return proxy.last_used
+            except Exception as e:
+                logger.debug(f"⚠️ ProxyManager: Ошибка при получении времени использования прокси {proxy_id} из БД: {e}")
         
         # Fallback на локальный кэш
         return self._last_used.get(proxy_id)
@@ -598,36 +613,38 @@ class ProxyManager:
         """
         Сохраняет время последнего использования прокси в БД.
         
-        ВАЖНО: Этот метод вызывается из mark_proxy_used, который уже защищен блокировкой.
-        Не используем блокировку здесь, чтобы избежать двойной блокировки.
+        ВАЖНО: Используем _db_lock для защиты БД операций, даже если вызывается из защищенного метода.
+        Это гарантирует безопасность при параллельных вызовах.
         
         Args:
             proxy_id: ID прокси
             timestamp: Время использования
         """
-        try:
-            # Обновляем в БД
-            from core import Proxy
-            from sqlalchemy import update
-            
-            await self.db_session.execute(
-                update(Proxy)
-                .where(Proxy.id == proxy_id)
-                .values(last_used=timestamp, updated_at=datetime.now())
-            )
-            await self.db_session.commit()
-            
-            # Обновляем локальный кэш
-            self._last_used[proxy_id] = timestamp
-            logger.debug(f"💾 ProxyManager: Сохранено время использования прокси {proxy_id} в БД: {timestamp}")
-        except Exception as e:
-            logger.warning(f"⚠️ ProxyManager: Ошибка при сохранении времени использования прокси {proxy_id} в БД: {e}")
-            # Fallback на локальный кэш
-            self._last_used[proxy_id] = timestamp
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
             try:
-                await self.db_session.rollback()
-            except Exception:
-                pass
+                # Обновляем в БД
+                from core import Proxy
+                from sqlalchemy import update
+                
+                await self.db_session.execute(
+                    update(Proxy)
+                    .where(Proxy.id == proxy_id)
+                    .values(last_used=timestamp, updated_at=datetime.now())
+                )
+                await self.db_session.commit()
+                
+                # Обновляем локальный кэш
+                self._last_used[proxy_id] = timestamp
+                logger.debug(f"💾 ProxyManager: Сохранено время использования прокси {proxy_id} в БД: {timestamp}")
+            except Exception as e:
+                logger.warning(f"⚠️ ProxyManager: Ошибка при сохранении времени использования прокси {proxy_id} в БД: {e}")
+                # Fallback на локальный кэш
+                self._last_used[proxy_id] = timestamp
+                try:
+                    await self.db_session.rollback()
+                except Exception:
+                    pass
     
     async def _get_last_proxy_index(self) -> Optional[int]:
         """
@@ -672,8 +689,9 @@ class ProxyManager:
     
     async def _is_proxy_temporarily_blocked(self, proxy_id: int) -> bool:
         """
-        Проверяет, заблокирован ли прокси временно из-за 429 ошибок.
-        Проверяет поле blocked_until в БД.
+        Проверяет, временно ли заблокирован прокси (из-за 429 ошибок).
+        ВАЖНО: Использует ТОЛЬКО Redis для проверки, БД не используется для чтения.
+        Это значительно быстрее и избегает конкурентных проблем.
         
         Args:
             proxy_id: ID прокси
@@ -681,75 +699,67 @@ class ProxyManager:
         Returns:
             True если прокси заблокирован, False если доступен
         """
-        # Сначала проверяем локальный кэш (быстрее)
+        # ВАЖНО: Проверяем ТОЛЬКО Redis, не обращаемся к БД для чтения
+        # БД используется только для записи блокировок, чтение - через Redis
+        if self.redis_service and self.redis_service._client:
+            try:
+                blocked_key = f"{self.REDIS_BLOCKED_PREFIX}{proxy_id}"
+                blocked_until_str = await self.redis_service._client.get(blocked_key)
+                if blocked_until_str:
+                    if isinstance(blocked_until_str, bytes):
+                        blocked_until_str = blocked_until_str.decode()
+                    blocked_until = datetime.fromisoformat(blocked_until_str)
+                    if datetime.now() < blocked_until:
+                        # Обновляем локальный кэш
+                        self._blocked_proxies[proxy_id] = blocked_until
+                        logger.debug(f"🔒 ProxyManager: Прокси ID={proxy_id} заблокирован до {blocked_until} (из Redis)")
+                        return True
+                    else:
+                        # Блокировка истекла, удаляем из Redis
+                        await self.redis_service._client.delete(blocked_key)
+                        logger.debug(f"🔓 ProxyManager: Прокси ID={proxy_id} разблокирован (блокировка истекла в Redis)")
+                        # ВАЖНО: Очищаем в БД асинхронно, не блокируя текущую операцию
+                        asyncio.create_task(self._clear_blocked_until_in_db(proxy_id))
+                        return False
+            except Exception as e:
+                logger.debug(f"⚠️ ProxyManager: Ошибка при проверке блокировки прокси {proxy_id} в Redis: {e}")
+        
+        # Если Redis недоступен, проверяем локальный кэш (fallback)
         if proxy_id in self._blocked_proxies:
             blocked_until = self._blocked_proxies[proxy_id]
-            now = datetime.now()
-            if now < blocked_until:
+            if datetime.now() < blocked_until:
                 return True
             else:
-                # Блокировка истекла в локальном кэше, очищаем в БД
+                # Блокировка истекла в локальном кэше
                 del self._blocked_proxies[proxy_id]
-                try:
-                    from core import Proxy
-                    from sqlalchemy import update
-                    await self.db_session.execute(
-                        update(Proxy)
-                        .where(Proxy.id == proxy_id)
-                        .values(blocked_until=None, updated_at=now)
-                    )
-                    await self.db_session.commit()
-                except Exception:
-                    try:
-                        await self.db_session.rollback()
-                    except Exception:
-                        pass
+                return False
         
-        try:
-            # Проверяем в БД
-            from core import Proxy
-            result = await self.db_session.execute(
-                select(Proxy).where(Proxy.id == proxy_id)
-            )
-            proxy = result.scalar_one_or_none()
-            
-            if proxy and proxy.blocked_until:
-                now = datetime.now()
-                if now < proxy.blocked_until:
-                    # Проверяем, можно ли использовать прокси раньше (ранняя разблокировка)
-                    # Если прошло больше EARLY_UNBLOCK_THRESHOLD секунд с момента блокировки, можно попробовать
-                    time_blocked = (now - (proxy.blocked_until - timedelta(seconds=self.BLOCK_DURATION_429_FIRST if proxy.fail_count < self.MAX_429_ERRORS_BEFORE_LONG_BLOCK else self.BLOCK_DURATION_429_MULTIPLE))).total_seconds()
-                    if time_blocked >= self.EARLY_UNBLOCK_THRESHOLD:
-                        # Прошло достаточно времени - разрешаем использовать прокси (ранняя разблокировка)
-                        logger.debug(f"🔓 ProxyManager: Прокси ID={proxy_id} доступен для ранней разблокировки (заблокирован {int(time_blocked/60)} мин назад)")
-                        return False
-                    # Обновляем локальный кэш
-                    self._blocked_proxies[proxy_id] = proxy.blocked_until
-                    logger.debug(f"🔒 ProxyManager: Прокси ID={proxy_id} заблокирован до {proxy.blocked_until}")
-                    return True
-                else:
-                    # Блокировка истекла, очищаем в БД
-                    from sqlalchemy import update
-                    await self.db_session.execute(
-                        update(Proxy)
-                        .where(Proxy.id == proxy_id)
-                        .values(blocked_until=None, updated_at=now)
-                    )
-                    await self.db_session.commit()
-                    if proxy_id in self._blocked_proxies:
-                        del self._blocked_proxies[proxy_id]
-                    logger.debug(f"🔓 ProxyManager: Блокировка прокси ID={proxy_id} истекла, очищена в БД")
-            
-            return False
-        except Exception as e:
-            # ВАЖНО: При любой ошибке считаем прокси НЕ заблокированным
-            # Это позволяет использовать рабочие прокси даже если БД недоступна
-            logger.debug(f"⚠️ ProxyManager: Ошибка при проверке блокировки прокси {proxy_id}: {e}, считаем прокси доступным")
+        # Прокси не заблокирован
+        return False
+    
+    async def _clear_blocked_until_in_db(self, proxy_id: int):
+        """
+        Асинхронно очищает blocked_until в БД для прокси.
+        Вызывается из фоновой задачи, не блокирует основную операцию.
+        """
+        # ВАЖНО: Используем отдельную блокировку для БД операций
+        async with self._db_lock:
             try:
-                await self.db_session.rollback()
-            except Exception:
-                pass
-            return False
+                from core import Proxy
+                from sqlalchemy import update
+                await self.db_session.execute(
+                    update(Proxy)
+                    .where(Proxy.id == proxy_id)
+                    .values(blocked_until=None, updated_at=datetime.now())
+                )
+                await self.db_session.commit()
+                logger.debug(f"🔓 ProxyManager: Блокировка прокси ID={proxy_id} очищена в БД (фоновая задача)")
+            except Exception as e:
+                logger.debug(f"⚠️ ProxyManager: Ошибка при очистке блокировки прокси {proxy_id} в БД: {e}")
+                try:
+                    await self.db_session.rollback()
+                except Exception:
+                    pass
     
     async def _block_proxy_temporarily(self, proxy_id: int, duration_seconds: int = None):
         """
@@ -765,29 +775,44 @@ class ProxyManager:
         
         logger.warning(f"🚫 ProxyManager: Временно блокируем прокси ID={proxy_id} на {duration//60} мин из-за 429 ошибок")
         
-        try:
-            # Сохраняем в БД
-            from core import Proxy
-            from sqlalchemy import update
-            
-            await self.db_session.execute(
-                update(Proxy)
-                .where(Proxy.id == proxy_id)
-                .values(blocked_until=blocked_until, updated_at=datetime.now())
-            )
-            await self.db_session.commit()
-            logger.info(f"✅ ProxyManager: Прокси ID={proxy_id} заблокирован в БД до {blocked_until.isoformat()}")
-        except Exception as e:
-            logger.error(f"❌ ProxyManager: Ошибка при блокировке прокси {proxy_id} в БД: {e}")
-            import traceback
-            logger.debug(f"Traceback: {traceback.format_exc()}")
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
             try:
-                await self.db_session.rollback()
-            except Exception:
-                pass
+                # Сохраняем в БД
+                from core import Proxy
+                from sqlalchemy import update
+                
+                await self.db_session.execute(
+                    update(Proxy)
+                    .where(Proxy.id == proxy_id)
+                    .values(blocked_until=blocked_until, updated_at=datetime.now())
+                )
+                await self.db_session.commit()
+                logger.info(f"✅ ProxyManager: Прокси ID={proxy_id} заблокирован в БД до {blocked_until.isoformat()}")
+            except Exception as e:
+                logger.error(f"❌ ProxyManager: Ошибка при блокировке прокси {proxy_id} в БД: {e}")
+                import traceback
+                logger.debug(f"Traceback: {traceback.format_exc()}")
+                try:
+                    await self.db_session.rollback()
+                except Exception:
+                    pass
         
         # Обновляем локальный кэш
         self._blocked_proxies[proxy_id] = blocked_until
+        
+        # ВАЖНО: Устанавливаем ключ блокировки в Redis для синхронизации
+        if self.redis_service and self.redis_service._client:
+            try:
+                blocked_key = f"{self.REDIS_BLOCKED_PREFIX}{proxy_id}"
+                await self.redis_service._client.setex(
+                    blocked_key,
+                    duration,
+                    blocked_until.isoformat()
+                )
+                logger.debug(f"🔒 ProxyManager: Прокси ID={proxy_id} заблокирован в Redis до {blocked_until.isoformat()}")
+            except Exception as e:
+                logger.warning(f"⚠️ ProxyManager: Ошибка при установке блокировки прокси {proxy_id} в Redis: {e}")
     
     async def _unblock_proxy(self, proxy_id: int):
         """
@@ -797,28 +822,40 @@ class ProxyManager:
         Args:
             proxy_id: ID прокси
         """
-        try:
-            # Очищаем в БД
-            from core import Proxy
-            from sqlalchemy import update
-            
-            await self.db_session.execute(
-                update(Proxy)
-                .where(Proxy.id == proxy_id)
-                .values(blocked_until=None, updated_at=datetime.now())
-            )
-            await self.db_session.commit()
-            logger.debug(f"🔓 ProxyManager: Прокси ID={proxy_id} разблокирован в БД")
-        except Exception as e:
-            logger.debug(f"⚠️ ProxyManager: Ошибка при разблокировке прокси {proxy_id} в БД: {e}")
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
             try:
-                await self.db_session.rollback()
-            except Exception:
-                pass
+                # Очищаем в БД
+                from core import Proxy
+                from sqlalchemy import update
+                
+                await self.db_session.execute(
+                    update(Proxy)
+                    .where(Proxy.id == proxy_id)
+                    .values(blocked_until=None, updated_at=datetime.now())
+                )
+                await self.db_session.commit()
+                logger.debug(f"🔓 ProxyManager: Прокси ID={proxy_id} разблокирован в БД")
+            except Exception as e:
+                logger.debug(f"⚠️ ProxyManager: Ошибка при разблокировке прокси {proxy_id} в БД: {e}")
+                try:
+                    await self.db_session.rollback()
+                except Exception:
+                    pass
         
         # Удаляем из локального кэша
         if proxy_id in self._blocked_proxies:
             del self._blocked_proxies[proxy_id]
+        
+        # ВАЖНО: Удаляем ключ блокировки из Redis для синхронизации
+        if self.redis_service and self.redis_service._client:
+            try:
+                blocked_key = f"{self.REDIS_BLOCKED_PREFIX}{proxy_id}"
+                deleted = await self.redis_service._client.delete(blocked_key)
+                if deleted:
+                    logger.debug(f"🔓 ProxyManager: Прокси ID={proxy_id} разблокирован в Redis (ключ удален)")
+            except Exception as e:
+                logger.warning(f"⚠️ ProxyManager: Ошибка при удалении блокировки прокси {proxy_id} из Redis: {e}")
         
         logger.info(f"✅ ProxyManager: Прокси ID={proxy_id} разблокирован (успешный запрос)")
         
@@ -1150,17 +1187,21 @@ class ProxyManager:
                 # Если нужно обновить статусы в Redis, получаем ВСЕ прокси из БД
                 # Иначе получаем только активные (как раньше)
                 if update_redis_status:
-                    try:
-                        result = await self.db_session.execute(
-                            select(Proxy).order_by(Proxy.id)
-                        )
-                        all_proxies = list(result.scalars().all())
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка при получении прокси из БД: {e}")
-                        return {"total": 0, "working": 0, "blocked": 0, "error": 0, "rate_limited": 0, "blocked_count": 0, "unblocked_count": 0, "results": []}
+                    # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+                    async with self._db_lock:
+                        try:
+                            result = await self.db_session.execute(
+                                select(Proxy).order_by(Proxy.id)
+                            )
+                            all_proxies = list(result.scalars().all())
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка при получении прокси из БД: {e}")
+                            return {"total": 0, "working": 0, "blocked": 0, "error": 0, "rate_limited": 0, "blocked_count": 0, "unblocked_count": 0, "results": []}
                 else:
-                    # Получаем все активные прокси
-                    all_proxies = await self.get_active_proxies(force_refresh=True)
+                    # Получаем все активные прокси из кэша Redis (без обращения к БД)
+                    # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                    # Данные уже актуальны, так как мы только что обновили их выше
+                    all_proxies = await self.get_active_proxies(force_refresh=False)
                 
                 total_proxies = len(all_proxies)
                 
@@ -1357,20 +1398,26 @@ class ProxyManager:
         try:
             # ВАЖНО: Получаем ВСЕ активные прокси из БД (включая заблокированные)
             # чтобы правильно посчитать заблокированные
-            try:
-                result = await self.db_session.execute(
-                    select(Proxy).where(Proxy.is_active == True).order_by(Proxy.id)
-                )
-                all_active_proxies = list(result.scalars().all())
-            except Exception as e:
-                logger.error(f"❌ ProxyManager: Ошибка при получении прокси из БД: {e}")
-                all_active_proxies = []
+            # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+            async with self._db_lock:
+                try:
+                    result = await self.db_session.execute(
+                        select(Proxy).where(Proxy.is_active == True).order_by(Proxy.id)
+                    )
+                    all_active_proxies = list(result.scalars().all())
+                except Exception as e:
+                    logger.error(f"❌ ProxyManager: Ошибка при получении прокси из БД: {e}")
+                    all_active_proxies = []
             
             blocked_info['total_active'] = len(all_active_proxies)
             
             # Проверяем каждый прокси на блокировку
+            # ВАЖНО: Проверяем блокировку внутри того же блока _db_lock, чтобы избежать конкурентного доступа
+            # Но _is_proxy_temporarily_blocked сам использует _db_lock, поэтому проверяем напрямую через proxy.blocked_until
             for proxy in all_active_proxies:
-                if await self._is_proxy_temporarily_blocked(proxy.id):
+                # Проверяем блокировку напрямую через поле proxy.blocked_until (уже получено из БД)
+                is_blocked = proxy.blocked_until and proxy.blocked_until > datetime.now()
+                if is_blocked:
                     blocked_info['blocked_count'] += 1
                     
                     # Получаем время разблокировки из БД
@@ -1469,24 +1516,50 @@ class ProxyManager:
                 # Определяем интервал ожидания в зависимости от количества заблокированных прокси
                 # (будет пересчитан внутри цикла, но здесь устанавливаем начальное значение)
                 wait_interval = self.BACKGROUND_CHECK_INTERVAL
-                # ВАЖНО: Получаем информацию о заблокированных прокси ТОЛЬКО из Redis (без обращения к БД)
-                # Это избегает конфликтов с сессией БД при параллельных операциях
-                # Получаем список всех заблокированных прокси из БД
-                try:
-                    from core import Proxy
-                    from sqlalchemy import select
-                    result = await self.db_session.execute(
-                        select(Proxy).where(
-                            Proxy.blocked_until.isnot(None),
-                            Proxy.blocked_until > datetime.now()
-                        )
-                    )
-                    blocked_proxies = result.scalars().all()
-                    blocked_count = len(blocked_proxies)
-                except Exception as e:
-                    logger.warning(f"⚠️ ProxyManager: Ошибка при получении заблокированных прокси из БД: {e}")
-                    blocked_count = 0
-                    blocked_proxies = []
+                # ВАЖНО: Получаем информацию о заблокированных прокси из Redis (не из БД!)
+                # Это значительно быстрее и избегает конкурентных проблем
+                blocked_proxies_list = []
+                blocked_count = 0
+                blocked_proxies_with_time = []
+                
+                if self.redis_service and self.redis_service._client:
+                    try:
+                        # Получаем все ключи заблокированных прокси из Redis
+                        pattern = f"{self.REDIS_BLOCKED_PREFIX}*"
+                        keys = await self.redis_service._client.keys(pattern)
+                        
+                        for key in keys:
+                            try:
+                                if isinstance(key, bytes):
+                                    key = key.decode()
+                                proxy_id_str = key.replace(self.REDIS_BLOCKED_PREFIX, "")
+                                proxy_id = int(proxy_id_str)
+                                
+                                # Получаем время блокировки
+                                blocked_until_str = await self.redis_service._client.get(key)
+                                if blocked_until_str:
+                                    if isinstance(blocked_until_str, bytes):
+                                        blocked_until_str = blocked_until_str.decode()
+                                    blocked_until = datetime.fromisoformat(blocked_until_str)
+                                    
+                                    # Проверяем, не истекла ли блокировка
+                                    if datetime.now() < blocked_until:
+                                        blocked_proxies_with_time.append((proxy_id, blocked_until))
+                                    else:
+                                        # Блокировка истекла, удаляем из Redis
+                                        await self.redis_service._client.delete(key)
+                                        # Очищаем в БД асинхронно
+                                        asyncio.create_task(self._clear_blocked_until_in_db(proxy_id))
+                            except (ValueError, TypeError) as e:
+                                logger.debug(f"⚠️ ProxyManager: Ошибка при обработке ключа блокировки {key}: {e}")
+                                continue
+                        
+                        blocked_count = len(blocked_proxies_with_time)
+                        logger.debug(f"🔍 ProxyManager: Найдено {blocked_count} заблокированных прокси в Redis")
+                    except Exception as e:
+                        logger.warning(f"⚠️ ProxyManager: Ошибка при получении заблокированных прокси из Redis: {e}")
+                        blocked_count = 0
+                        blocked_proxies_with_time = []
                 
                 # Получаем время последней умной проверки
                 last_smart_check = None
@@ -1499,15 +1572,19 @@ class ProxyManager:
                 except Exception:
                     pass
                 
-                # Получаем общее количество активных прокси для определения процента заблокированных
+                # Получаем общее количество активных прокси из Redis кэша (не из БД!)
+                # Это значительно быстрее и избегает конкурентных проблем
                 try:
-                    from core import Proxy
-                    total_result = await self.db_session.execute(
-                        select(func.count(Proxy.id)).where(Proxy.is_active == True)
-                    )
-                    total_proxies = total_result.scalar() or 0
+                    all_active_proxies = await self.get_active_proxies(force_refresh=False)
+                    total_proxies = len(all_active_proxies)
+                    # ВАЖНО: total_proxies - это количество НЕ заблокированных прокси из кэша
+                    # Нужно добавить заблокированные, чтобы получить общее количество активных
+                    # Но для расчета процента используем только заблокированные из Redis
+                    # Если в Redis есть заблокированные, значит общее количество = активные + заблокированные
+                    total_proxies = total_proxies + blocked_count
                     blocked_ratio = blocked_count / total_proxies if total_proxies > 0 else 0
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"⚠️ ProxyManager: Ошибка при получении количества активных прокси: {e}")
                     total_proxies = 0
                     blocked_ratio = 0
                 
@@ -1535,12 +1612,7 @@ class ProxyManager:
                             logger.debug(f"⏸️ Фоновая проверка: Найдено {blocked_count}/{total_proxies} заблокированных прокси ({blocked_ratio*100:.1f}%), но умная проверка была {int(time_since_last_check/60)} мин назад. Пропускаем еще {minutes_left} мин")
                 
                 if should_do_smart_check and blocked_count > 0:
-                    # Получаем заблокированные прокси с их временем блокировки из БД
-                    blocked_proxies_with_time = []
-                    for proxy in blocked_proxies:
-                        if proxy.blocked_until:
-                            blocked_proxies_with_time.append((proxy.id, proxy.blocked_until))
-                    
+                    # ВАЖНО: blocked_proxies_with_time уже получен из Redis выше
                     # Сортируем по времени блокировки (самые старые первыми - у них blocked_until раньше)
                     blocked_proxies_with_time.sort(key=lambda x: x[1])
                     
@@ -1549,22 +1621,23 @@ class ProxyManager:
                     proxies_by_id = {p.id: p for p in all_active_proxies}
                     
                     # Собираем заблокированные прокси для проверки (уже отсортированные по времени блокировки)
-                    blocked_proxies = []
+                    # ВАЖНО: Используем объекты из кэша (proxies_by_id), а не из БД, чтобы избежать detached объектов
+                    blocked_proxies_to_check = []
                     for proxy_id, blocked_until in blocked_proxies_with_time:
                         if proxy_id in proxies_by_id:
-                            blocked_proxies.append(proxies_by_id[proxy_id])
+                            blocked_proxies_to_check.append(proxies_by_id[proxy_id])
                     
                     # Инициализируем счетчики
                     checked_count = 0
                     unblocked_count = 0
                     
-                    if blocked_proxies:
-                        logger.info(f"🧠 Умная проверка: Начинаем с самых старых заблокированных прокси (всего {len(blocked_proxies)})")
+                    if blocked_proxies_to_check:
+                        logger.info(f"🧠 Умная проверка: Начинаем с самых старых заблокированных прокси (всего {len(blocked_proxies_to_check)})")
                         
                         # Проверяем прокси начиная с самых старых
                         # Если старый прокси разблокировался - продолжаем проверять остальные
-                        for i in range(0, len(blocked_proxies), self.BACKGROUND_CHECK_MAX_CONCURRENT):
-                            batch = blocked_proxies[i:i + self.BACKGROUND_CHECK_MAX_CONCURRENT]
+                        for i in range(0, len(blocked_proxies_to_check), self.BACKGROUND_CHECK_MAX_CONCURRENT):
+                            batch = blocked_proxies_to_check[i:i + self.BACKGROUND_CHECK_MAX_CONCURRENT]
                             
                             # Проверяем группу прокси параллельно
                             tasks = []
@@ -1641,13 +1714,15 @@ class ProxyManager:
     
     async def deactivate_proxy(self, proxy_id: int, reason: str = ""):
         """Деактивирует прокси и обновляет кэш в Redis."""
-        await self.db_session.execute(
-            update(Proxy)
-            .where(Proxy.id == proxy_id)
-            .values(is_active=False)
-        )
-        await self.db_session.commit()
-        logger.debug(f"Прокси {proxy_id} деактивирован. Причина: {reason}")
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
+            await self.db_session.execute(
+                update(Proxy)
+                .where(Proxy.id == proxy_id)
+                .values(is_active=False)
+            )
+            await self.db_session.commit()
+            logger.debug(f"Прокси {proxy_id} деактивирован. Причина: {reason}")
         
         # Обновляем кэш в Redis
         await self._update_redis_cache()
@@ -1662,16 +1737,17 @@ class ProxyManager:
         Returns:
             True если прокси был удален, False если не найден
         """
-        async with self._lock:
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
             result = await self.db_session.execute(
                 select(Proxy).where(Proxy.id == proxy_id)
             )
             proxy = result.scalar_one_or_none()
-            
+
             if not proxy:
                 logger.warning(f"Прокси {proxy_id} не найден для удаления")
                 return False
-            
+
             await self.db_session.execute(
                 delete(Proxy).where(Proxy.id == proxy_id)
             )
@@ -1696,7 +1772,8 @@ class ProxyManager:
         Returns:
             Словарь с результатами: {'removed': количество удаленных, 'kept': количество оставленных}
         """
-        async with self._lock:
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
             # Получаем все прокси
             result = await self.db_session.execute(
                 select(Proxy).order_by(Proxy.id)
@@ -1754,13 +1831,15 @@ class ProxyManager:
     
     async def activate_proxy(self, proxy_id: int):
         """Активирует прокси и обновляет кэш в Redis."""
-        await self.db_session.execute(
-            update(Proxy)
-            .where(Proxy.id == proxy_id)
-            .values(is_active=True, fail_count=0, last_error=None)
-        )
-        await self.db_session.commit()
-        logger.debug(f"Прокси {proxy_id} активирован")
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
+            await self.db_session.execute(
+                update(Proxy)
+                .where(Proxy.id == proxy_id)
+                .values(is_active=True, fail_count=0, last_error=None)
+            )
+            await self.db_session.commit()
+            logger.debug(f"Прокси {proxy_id} активирован")
         
         # Обновляем кэш в Redis
         await self._update_redis_cache()
@@ -1770,33 +1849,35 @@ class ProxyManager:
         Получает статистику по прокси.
         ВАЖНО: Читает напрямую из БД, чтобы получить актуальную статистику (не из кэша).
         """
-        # Получаем все прокси напрямую из БД (не из кэша) для актуальной статистики
-        all_proxies_result = await self.db_session.execute(select(Proxy))
-        all_proxies = list(all_proxies_result.scalars().all())
-        
-        # Подсчитываем активные прокси
-        active_proxies = [p for p in all_proxies if p.is_active]
-        
-        logger.debug(f"📊 ProxyManager: Получена статистика из БД: всего={len(all_proxies)}, активных={len(active_proxies)}")
-        
-        return {
-            "total": len(all_proxies),
-            "active": len(active_proxies),
-            "inactive": len(all_proxies) - len(active_proxies),
-            "proxies": [
-                {
-                    "id": p.id,
-                    "url": p.url[:30] + "..." if len(p.url) > 30 else p.url,
-                    "active": p.is_active,
-                    "success_count": p.success_count,
-                    "fail_count": p.fail_count,
-                    "delay": p.delay_seconds,
-                    "delay_seconds": p.delay_seconds,  # Добавляем для совместимости
-                    "last_used": p.last_used.isoformat() if p.last_used else None
-                }
-                for p in all_proxies
-            ]
-        }
+        # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
+        async with self._db_lock:
+            # Получаем все прокси напрямую из БД (не из кэша) для актуальной статистики
+            all_proxies_result = await self.db_session.execute(select(Proxy))
+            all_proxies = list(all_proxies_result.scalars().all())
+            
+            # Подсчитываем активные прокси
+            active_proxies = [p for p in all_proxies if p.is_active]
+            
+            logger.debug(f"📊 ProxyManager: Получена статистика из БД: всего={len(all_proxies)}, активных={len(active_proxies)}")
+            
+            return {
+                "total": len(all_proxies),
+                "active": len(active_proxies),
+                "inactive": len(all_proxies) - len(active_proxies),
+                "proxies": [
+                    {
+                        "id": p.id,
+                        "url": p.url[:30] + "..." if len(p.url) > 30 else p.url,
+                        "active": p.is_active,
+                        "success_count": p.success_count,
+                        "fail_count": p.fail_count,
+                        "delay": p.delay_seconds,
+                        "delay_seconds": p.delay_seconds,  # Добавляем для совместимости
+                        "last_used": p.last_used.isoformat() if p.last_used else None
+                    }
+                    for p in all_proxies
+                ]
+            }
     
     async def use_proxy(self, min_delay: float = 0.0, force_refresh: bool = False) -> ProxyContext:
         """

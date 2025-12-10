@@ -81,12 +81,14 @@ class ParsingService:
                     logger.info(f"✅ ParsingService: [ШАГ 1/4] Прокси получен: ID={proxy.id if proxy else 'None'}")
                 except asyncio.TimeoutError:
                     logger.warning(f"⚠️ ParsingService: [ШАГ 1/4] Таймаут при получении прокси ({PROXY_TIMEOUT} сек)")
-                    logger.warning(f"   💡 Все прокси могут быть заняты или заблокированы. Пробуем принудительно обновить список прокси...")
-                    # Пробуем принудительно обновить список прокси и получить доступный
+                    logger.warning(f"   💡 Все прокси могут быть заняты или заблокированы. Пробуем получить прокси из кэша...")
+                    # Пробуем получить прокси из кэша (без обращения к БД)
+                    # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                    # Данные в кэше актуальны, так как они обновляются при блокировке/разблокировке прокси
                     try:
-                        logger.info(f"   🔄 ParsingService: [ШАГ 1/4] Пробуем получить прокси с force_refresh=True...")
+                        logger.info(f"   🔄 ParsingService: [ШАГ 1/4] Пробуем получить прокси из кэша...")
                         proxy = await asyncio.wait_for(
-                            self.proxy_manager.get_next_proxy(force_refresh=True),
+                            self.proxy_manager.get_next_proxy(force_refresh=False),
                             timeout=10.0  # Короткий таймаут для повторной попытки
                         )
                         if proxy:
@@ -97,6 +99,40 @@ class ParsingService:
                         logger.warning(f"   ⚠️ ParsingService: [ШАГ 1/4] Не удалось получить прокси после обновления: {e2}")
                         logger.warning(f"   💡 Продолжаем без прокси (с ограничениями)")
                         proxy = None
+                        
+                        # ВАЖНО: Отправляем уведомление в Telegram если все прокси недоступны (429)
+                        if proxy is None and self.proxy_manager:
+                            try:
+                                # Проверяем, все ли прокси заблокированы (429)
+                                active_proxies = await self.proxy_manager.get_active_proxies(force_refresh=False)
+                                if active_proxies:
+                                    blocked_count = 0
+                                    for p in active_proxies:
+                                        if await self.proxy_manager._is_proxy_temporarily_blocked(p.id):
+                                            blocked_count += 1
+                                    
+                                    # Если все прокси заблокированы - отправляем уведомление
+                                    if blocked_count == len(active_proxies) and blocked_count > 0:
+                                        from services.telegram_notifier import send_proxy_unavailable_notification
+                                        # Получаем минимальное время до разблокировки
+                                        min_delay = 600.0  # 10 минут по умолчанию
+                                        for p in active_proxies:
+                                            if p.blocked_until:
+                                                from datetime import datetime
+                                                delay = (p.blocked_until - datetime.now()).total_seconds()
+                                                if delay > 0 and delay < min_delay:
+                                                    min_delay = delay
+                                        
+                                        asyncio.create_task(
+                                            send_proxy_unavailable_notification(
+                                                blocked_count=blocked_count,
+                                                total_count=len(active_proxies),
+                                                oldest_proxy_delay=min_delay
+                                            )
+                                        )
+                                        logger.warning(f"📢 ParsingService: Отправлено уведомление в Telegram - все {blocked_count} прокси заблокированы (429)")
+                            except Exception as notify_error:
+                                logger.debug(f"⚠️ ParsingService: Ошибка при отправке уведомления: {notify_error}")
             except Exception as e:
                 logger.error(f"❌ ParsingService: [ШАГ 1/4] ОШИБКА при получении прокси: {e}")
                 import traceback

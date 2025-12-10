@@ -207,17 +207,19 @@ class ListingParser:
                 
                 # Если прошло больше 5 минут и нет доступных прокси - обновляем список
                 if time_since_check > PROXY_CHECK_INTERVAL and (not available_proxies or len(available_proxies) == 0):
-                    log("info", f"    🔄 Страница {page_num}: Прошло {time_since_check:.0f} сек с последней проверки, обновляем список прокси...")
+                    log("info", f"    🔄 Страница {page_num}: Прошло {time_since_check:.0f} сек с последней проверки, получаем список прокси из кэша...")
                     last_proxy_check_time = current_time
-                    available_proxies = await parser.proxy_manager.get_active_proxies(force_refresh=True)
+                    # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                    available_proxies = await parser.proxy_manager.get_active_proxies(force_refresh=False)
                     log("info", f"    📊 Страница {page_num}: После обновления доступно {len(available_proxies) if available_proxies else 0} прокси")
             
             if parser.proxy_manager:
                 available_proxies = await parser.proxy_manager.get_active_proxies(force_refresh=False)
                 
                 if not available_proxies:
-                    log("warning", f"    ⚠️ Страница {page_num}: Нет доступных прокси, пробуем обновить список")
-                    available_proxies = await parser.proxy_manager.get_active_proxies(force_refresh=True)
+                    log("warning", f"    ⚠️ Страница {page_num}: Нет доступных прокси, пробуем получить из кэша")
+                    # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                    available_proxies = await parser.proxy_manager.get_active_proxies(force_refresh=False)
                 
                 max_proxy_attempts = len(available_proxies) if available_proxies else 3  # Уменьшено с 20 до 3, чтобы не зависать
                 log("info", f"    📊 Страница {page_num}: Доступно {len(available_proxies) if available_proxies else 0} прокси, максимум попыток: {max_proxy_attempts}")
@@ -231,7 +233,8 @@ class ListingParser:
                     else:
                         log("info", f"    🔄 Страница {page_num}: Попытка {attempt + 1} - получаем прокси через get_next_proxy (precheck={attempt == 0})...")
                         if parser and parser.proxy_manager:
-                            page_proxy = await parser.proxy_manager.get_next_proxy(force_refresh=(attempt == 0), precheck=(attempt == 0))
+                            # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                            page_proxy = await parser.proxy_manager.get_next_proxy(force_refresh=False, precheck=(attempt == 0))
                         else:
                             page_proxy = None
                         if not page_proxy:
@@ -302,7 +305,8 @@ class ListingParser:
                         if should_check:
                             log("info", f"    🔄 Страница {page_num}: Проверяем доступность прокси (цикл ожидания {wait_cycle}, прошло {time_since_check:.0f} сек)...")
                             last_proxy_check_time = current_time
-                            available_proxies = await parser.proxy_manager.get_active_proxies(force_refresh=True)
+                            # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                            available_proxies = await parser.proxy_manager.get_active_proxies(force_refresh=False)
                             log("info", f"    📊 Страница {page_num}: После обновления доступно {len(available_proxies) if available_proxies else 0} прокси")
                             
                             # Если появились доступные прокси - пробуем снова

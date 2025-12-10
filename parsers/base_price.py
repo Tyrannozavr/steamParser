@@ -60,7 +60,8 @@ class BasePriceAPI:
                 elif proxy_manager and attempt > 0:
                     # Пробуем другой прокси при повторной попытке
                     logger.info(f"    🔄 BasePriceAPI: Попытка {attempt + 1}/{max_retries} с другим прокси для '{item_name}'")
-                    next_proxy = await proxy_manager.get_next_proxy(force_refresh=True)
+                    # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+                    next_proxy = await proxy_manager.get_next_proxy(force_refresh=False)
                     if next_proxy and next_proxy.url not in used_proxies:
                         current_proxy = next_proxy.url
                         current_proxy_obj = next_proxy

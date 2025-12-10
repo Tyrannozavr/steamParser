@@ -448,6 +448,25 @@ class RedisService:
         except Exception as e:
             logger.error(f"❌ Redis: Ошибка при сохранении JSON по ключу '{key}': {e}")
 
+    async def get(self, key: str) -> Optional[str]:
+        """
+        Получает значение по ключу из Redis.
+        
+        Args:
+            key: Ключ для получения значения
+            
+        Returns:
+            Значение или None если ключ не найден
+        """
+        if self._client is None:
+            await self.connect()
+        
+        try:
+            return await self._client.get(key)
+        except Exception as e:
+            logger.error(f"❌ RedisService.get: Ошибка при получении '{key}': {e}")
+            return None
+    
     async def delete_key(self, key: str):
         """
         Удаляет ключ из Redis.

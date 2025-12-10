@@ -69,6 +69,8 @@ class SteamHelperMethods:
         Переключается на другой прокси через proxy_manager.
         Обновляет список активных прокси, чтобы исключить заблокированные.
         
+        ВАЖНО: Не обращается к БД, использует только Redis кэш для быстрого переключения.
+        
         Returns:
             True если прокси был переключен, False если не удалось
         """
@@ -76,24 +78,15 @@ class SteamHelperMethods:
             return False
         
         try:
-            # Проверяем состояние сессии БД и делаем rollback при необходимости
-            if hasattr(self.proxy_manager, 'db_session'):
-                try:
-                    # Пытаемся проверить состояние сессии
-                    from sqlalchemy.orm import Session
-                    if hasattr(self.proxy_manager.db_session, 'is_active'):
-                        # Если сессия неактивна или была откачена, делаем rollback
-                        try:
-                            await self.proxy_manager.db_session.rollback()
-                        except Exception:
-                            pass  # Игнорируем ошибки rollback
-                except Exception:
-                    pass  # Игнорируем ошибки проверки сессии
+            # ВАЖНО: НЕ проверяем состояние сессии БД и НЕ делаем rollback
+            # Это может вызвать конфликты при параллельных операциях
+            # Просто используем Redis кэш для получения прокси
             
-            # Обновляем список активных прокси, чтобы исключить заблокированные
-            all_proxies = await self.proxy_manager.get_active_proxies(force_refresh=True)
+            # Получаем список активных прокси из кэша (без обращения к БД)
+            # ВАЖНО: Используем force_refresh=False, чтобы не обращаться к БД
+            all_proxies = await self.proxy_manager.get_active_proxies(force_refresh=False)
             if not all_proxies:
-                logger.warning(f"⚠️ Нет доступных прокси для переключения")
+                logger.warning(f"⚠️ Нет доступных прокси для переключения (из кэша)")
                 return False
             
             current_proxy_id = None
@@ -103,8 +96,10 @@ class SteamHelperMethods:
                         current_proxy_id = p.id
                         break
             
-            # Получаем следующий прокси (исключая текущий)
-            next_proxy = await self.proxy_manager.get_next_proxy(force_refresh=True)
+            # Получаем следующий прокси из кэша (исключая текущий)
+            # ВАЖНО: Используем force_refresh=False и skip_delay=True для быстрого переключения
+            # Это позволяет мгновенно переключиться на другой прокси без ожидания
+            next_proxy = await self.proxy_manager.get_next_proxy(force_refresh=False, skip_delay=True)
             
             if not next_proxy:
                 logger.warning(f"⚠️ Не удалось получить следующий прокси")
