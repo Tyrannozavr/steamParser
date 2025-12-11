@@ -68,9 +68,23 @@ class TelegramBotApplication:
         # Применяем миграции БД перед инициализацией
         import subprocess
         import os
-        migration_script = "/app/docker/apply-migrations.sh"
-        if os.path.exists(migration_script):
-            logger.info("🔄 Применение миграций базы данных...")
+        # ВАЖНО: Проверяем несколько возможных путей к скрипту миграций
+        # 1. Путь из volume монтирования (docker-compose)
+        # 2. Путь из образа (если файл скопирован в Dockerfile)
+        migration_script = None
+        possible_paths = [
+            "/app/docker/apply-migrations.sh",  # Основной путь
+            "./docker/apply-migrations.sh",     # Относительный путь
+            "docker/apply-migrations.sh",       # Относительный путь без точки
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                migration_script = path
+                break
+        
+        if migration_script:
+            logger.info(f"🔄 Применение миграций базы данных... (скрипт: {migration_script})")
             try:
                 env = os.environ.copy()
                 env['POSTGRES_HOST'] = 'postgres'
