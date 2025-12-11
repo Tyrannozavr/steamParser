@@ -50,12 +50,18 @@ REDIS_PORT=6379
 REDIS_DB=0
 
 # Telegram Bot
+# ВАЖНО: Укажите реальный токен бота, полученный от @BotFather в Telegram
+# Если оставить "your_bot_token_here", бот не запустится
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 
 # Уровень логирования
 LOG_LEVEL=INFO
 ```
+
+**⚠️ Важно:** 
+- Обязательно укажите реальный `TELEGRAM_BOT_TOKEN` от @BotFather
+- Без валидного токена Telegram бот не запустится
 
 #### 3. Запуск через Docker Compose
 
