@@ -128,16 +128,37 @@ class ProxyManager:
             # Нормализуем URL для проверки уникальности
             normalized_url = ProxyManager._normalize_proxy_url(url)
             
-            # Проверяем, не существует ли уже такой прокси (по нормализованному URL)
-            # Получаем все прокси и проверяем нормализованные URL
+            # ОПТИМИЗАЦИЯ: Вместо загрузки всех прокси, используем SQL запрос для проверки существования
+            # Это значительно быстрее при большом количестве прокси
+            # Проверяем по нормализованному URL (сравниваем нормализованные версии)
+            # Загружаем все прокси только если нужно сравнить нормализованные URL
+            # Но сначала пробуем быструю проверку по точному совпадению URL
             result = await self.db_session.execute(
-                select(Proxy)
+                select(Proxy).where(Proxy.url == normalized_url)
             )
-            all_proxies = result.scalars().all()
+            existing_proxy = result.scalar_one_or_none()
             
-            for existing_proxy in all_proxies:
-                existing_normalized = ProxyManager._normalize_proxy_url(existing_proxy.url)
+            if existing_proxy:
+                logger.warning(f"⚠️ Прокси уже существует (точное совпадение URL): {normalized_url} (ID: {existing_proxy.id})")
+                return existing_proxy
+            
+            # Если точного совпадения нет, проверяем нормализованные URL
+            # Это нужно, так как один и тот же прокси может быть сохранен в разных форматах
+            # Но загружаем только URL, не все поля, для экономии памяти
+            from sqlalchemy import func
+            result = await self.db_session.execute(
+                select(Proxy.id, Proxy.url)
+            )
+            all_proxy_urls = result.all()
+            
+            for proxy_id, proxy_url in all_proxy_urls:
+                existing_normalized = ProxyManager._normalize_proxy_url(proxy_url)
                 if existing_normalized == normalized_url:
+                    # Нашли совпадение - загружаем полный объект
+                    full_result = await self.db_session.execute(
+                        select(Proxy).where(Proxy.id == proxy_id)
+                    )
+                    existing_proxy = full_result.scalar_one()
                     logger.warning(f"⚠️ Прокси уже существует (нормализованный URL совпадает): {normalized_url} (ID: {existing_proxy.id}, оригинальный URL: {existing_proxy.url})")
                     return existing_proxy
             
@@ -155,10 +176,10 @@ class ProxyManager:
             
             logger.debug(f"✅ Добавлен новый прокси: {normalized_url} (ID: {proxy.id})")
             
-            # Обновляем кэш в Redis
-            logger.debug("🔄 ProxyManager: Обновление кэша в Redis после добавления прокси...")
-            await self._update_redis_cache()
-            logger.debug("✅ ProxyManager: Завершено обновление кэша в Redis")
+            # ОПТИМИЗАЦИЯ: Не обновляем Redis кэш после каждого прокси при массовом добавлении
+            # Кэш будет обновлен в proxy_handlers после батча прокси
+            # Это значительно ускоряет массовое добавление
+            # Обновление кэша можно вызвать вручную через _update_redis_cache() если нужно
             
             return proxy
     

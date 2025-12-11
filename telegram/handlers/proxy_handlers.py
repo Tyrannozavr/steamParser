@@ -79,22 +79,8 @@ class ProxyHandlers:
         normalized_url, original_url, has_extra_param = self.normalize_proxy_url(proxy_url)
         
         try:
-            # Проверяем, существует ли уже такой прокси (по нормализованному URL)
-            check_result = await proxy_manager.db_session.execute(
-                select(Proxy)
-            )
-            all_proxies = check_result.scalars().all()
-            existing_proxy = None
-            for p in all_proxies:
-                p_normalized = ProxyManager._normalize_proxy_url(p.url)
-                if p_normalized == normalized_url:
-                    existing_proxy = p
-                    break
-            
-            if existing_proxy:
-                response_msg = f"⏭️ Прокси уже существует (ID: {existing_proxy.id})\n📝 URL: {normalized_url}"
-                logger.info(f"⏭️ Прокси уже существует: {normalized_url} (ID: {existing_proxy.id})")
-                return True, response_msg, existing_proxy.id
+            # ВАЖНО: Не проверяем существование здесь - это делает add_proxy внутри
+            # Это избегает двойной загрузки всех прокси из БД
             
             # Сначала пробуем стандартный формат
             try:
@@ -105,6 +91,24 @@ class ProxyHandlers:
                 logger.info(f"✅ Прокси добавлен через бота: {normalized_url} (оригинал: {original_url}, ID: {proxy.id})")
                 return True, response_msg, proxy.id
             except Exception as e1:
+                # Проверяем, не была ли это ошибка "уже существует"
+                error_str = str(e1).lower()
+                if "уже существует" in error_str or "already exists" in error_str or "duplicate" in error_str:
+                    # Прокси уже существует - пытаемся найти его
+                    try:
+                        # Используем быстрый SQL запрос вместо загрузки всех прокси
+                        from sqlalchemy import func
+                        result = await proxy_manager.db_session.execute(
+                            select(Proxy).where(func.lower(Proxy.url) == normalized_url.lower())
+                        )
+                        existing_proxy = result.scalar_one_or_none()
+                        if existing_proxy:
+                            response_msg = f"⏭️ Прокси уже существует (ID: {existing_proxy.id})\n📝 URL: {normalized_url}"
+                            logger.info(f"⏭️ Прокси уже существует: {normalized_url} (ID: {existing_proxy.id})")
+                            return True, response_msg, existing_proxy.id
+                    except Exception:
+                        pass
+                
                 # Если стандартный формат не работает, пробуем оригинальный
                 if has_extra_param:
                     logger.warning(f"⚠️ Стандартный формат не сработал, пробуем оригинальный: {e1}")
@@ -199,6 +203,11 @@ class ProxyHandlers:
                 fail_count = 0
                 skipped_count = 0
                 
+                # ОПТИМИЗАЦИЯ: Обрабатываем прокси с периодическим обновлением Redis кэша
+                # Вместо обновления после каждого прокси, обновляем каждые 10 прокси
+                BATCH_SIZE = 10
+                processed = 0
+                
                 for original_idx, proxy_url in unique_lines:
                     success, msg, proxy_id = await self.add_single_proxy(proxy_url, proxy_manager)
                     
@@ -212,6 +221,23 @@ class ProxyHandlers:
                     else:
                         fail_count += 1
                         results.append(f"{original_idx}. ❌ {msg.split('❌')[1].strip() if '❌' in msg else 'Ошибка'}")
+                    
+                    processed += 1
+                    # Обновляем Redis кэш каждые BATCH_SIZE прокси для баланса между производительностью и актуальностью
+                    if processed % BATCH_SIZE == 0 and proxy_manager.redis_service:
+                        try:
+                            await proxy_manager._update_redis_cache()
+                            logger.debug(f"🔄 Обновлен Redis кэш после обработки {processed} прокси")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Ошибка при обновлении Redis кэша: {e}")
+                
+                # Финальное обновление Redis кэша после всех прокси
+                if proxy_manager.redis_service:
+                    try:
+                        await proxy_manager._update_redis_cache()
+                        logger.debug("🔄 Финальное обновление Redis кэша после обработки всех прокси")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка при финальном обновлении Redis кэша: {e}")
                 
                 # Формируем итоговое сообщение
                 result_text = f"📊 <b>Результаты добавления прокси:</b>\n\n"
