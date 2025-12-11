@@ -48,9 +48,10 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./docker/apply-migrations.sh:/app/docker/apply-migrations.sh:ro
+      # ВАЖНО: В dev режиме весь проект монтируется через - .:/app
+      # Файл apply-migrations.sh должен быть в репозитории
       - ./migrations:/app/migrations:ro
-      - .:/app  # Монтируем код для hot-reload
+      - .:/app  # Монтируем код для hot-reload (включая docker/apply-migrations.sh)
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
