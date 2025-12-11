@@ -65,11 +65,18 @@ class TelegramBotApplication:
         logger.info(f"📅 Обновлено: {VERSION_INFO.get('last_updated', 'unknown')}")
         logger.info("=" * 80)
         
-        # Применяем миграции БД перед инициализацией
+        # ВАЖНО: Сначала инициализируем БД (создаем таблицы через SQLAlchemy)
+        # Затем применяем миграции для изменения структуры существующих таблиц
+        self.db_manager = DatabaseManager(Config.DATABASE_URL)
+        await self.db_manager.init_db()
+        logger.info("✅ Таблицы БД созданы через SQLAlchemy")
+        
+        # Применяем миграции БД после создания таблиц (если скрипт доступен)
+        # ВАЖНО: Это не критично - если скрипт недоступен, миграции можно применить вручную
         import subprocess
         import os
         migration_script = "/app/docker/apply-migrations.sh"
-        if os.path.exists(migration_script):
+        if os.path.exists(migration_script) and os.access(migration_script, os.X_OK):
             logger.info("🔄 Применение миграций базы данных...")
             try:
                 env = os.environ.copy()
@@ -89,10 +96,12 @@ class TelegramBotApplication:
                                 logger.info(f"   {line}")
                 else:
                     logger.warning(f"⚠️ Ошибка при применении миграций: {result.stderr}")
+            except FileNotFoundError:
+                logger.debug(f"ℹ️ Скрипт миграций не найден: {migration_script} (это нормально, если файл не смонтирован)")
             except Exception as e:
-                logger.warning(f"⚠️ Не удалось применить миграции: {e}")
+                logger.debug(f"ℹ️ Не удалось применить миграции: {e} (это не критично)")
         else:
-            logger.debug(f"ℹ️ Скрипт миграций не найден: {migration_script}")
+            logger.debug(f"ℹ️ Скрипт миграций недоступен: {migration_script} (это нормально, миграции можно применить вручную)")
         
         # Инициализируем БД
         self.db_manager = DatabaseManager(Config.DATABASE_URL)
