@@ -42,8 +42,9 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      # ВАЖНО: Файл apply-migrations.sh копируется в образ при сборке (COPY . /app)
-      # Монтирование volume опционально - если файл отсутствует локально, используется версия из образа
+      # ВАЖНО: Файл apply-migrations.sh копируется в образ при сборке (COPY . /app в Dockerfile)
+      # Монтирование volume позволяет обновить скрипт без пересборки образа
+      # Если файл отсутствует локально, используется версия из образа
       - ./docker/apply-migrations.sh:/app/docker/apply-migrations.sh:ro
       - ./migrations:/app/migrations:ro
       # Логирование в файлы отключено для production
