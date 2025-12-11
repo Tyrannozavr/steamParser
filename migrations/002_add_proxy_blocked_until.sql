@@ -1,10 +1,22 @@
 -- Миграция: Добавление поля blocked_until в таблицу proxies
 -- Дата: 2025-12-05
 -- Описание: Добавляет поле для временных блокировок прокси вместо хранения в Redis
+-- ВАЖНО: Эта миграция применяется только если таблица proxies уже существует
 
--- Добавляем поле blocked_until для временных блокировок
-ALTER TABLE proxies 
-ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMP NULL;
+DO \$\$
+BEGIN
+  -- Проверяем, существует ли таблица
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'proxies') THEN
+    -- Добавляем поле blocked_until для временных блокировок (если его еще нет)
+    IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns 
+      WHERE table_name = 'proxies' 
+      AND column_name = 'blocked_until'
+    ) THEN
+      ALTER TABLE proxies ADD COLUMN blocked_until TIMESTAMP NULL;
+    END IF;
+  END IF;
+END \$\$;
 
 -- Добавляем комментарий к полю
 COMMENT ON COLUMN proxies.blocked_until IS 'Время до которого прокси заблокирован (NULL = не заблокирован)';
