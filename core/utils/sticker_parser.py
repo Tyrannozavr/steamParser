@@ -261,3 +261,9 @@ class StickerPriceResolver:
 
 
 
+
+
+
+
+
+
