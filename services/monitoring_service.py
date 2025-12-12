@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core import MonitoringTask, FoundItem, SearchFilters
+from core.database import DatabaseManager
 from services.proxy_manager import ProxyManager
 from services.parsing_service import ParsingService
 from services.redis_service import RedisService
@@ -28,25 +29,30 @@ class MonitoringService:
         proxy_manager: ProxyManager,
         notification_callback: Optional[Callable] = None,
         parsing_service: Optional[ParsingService] = None,
-        redis_service: Optional[RedisService] = None
+        redis_service: Optional[RedisService] = None,
+        db_manager: Optional[DatabaseManager] = None
     ):
         """
         Инициализация сервиса мониторинга.
         
         Args:
-            db_session: Сессия базы данных
+            db_session: Сессия базы данных (используется для синхронных операций)
             proxy_manager: Менеджер прокси
             notification_callback: Функция для отправки уведомлений (item, task) - используется если Redis не доступен
             parsing_service: Сервис парсинга (если None, создается автоматически)
             redis_service: Сервис Redis для асинхронных уведомлений (опционально)
+            db_manager: Менеджер БД для создания отдельных сессий в корутинах (опционально, рекомендуется)
         """
         self.db_session = db_session
+        self.db_manager = db_manager  # Для создания отдельных сессий в корутинах
         self.proxy_manager = proxy_manager
         self.notification_callback = notification_callback
         self.redis_service = redis_service
         self._running = False
         self._tasks: Dict[int, asyncio.Task] = {}
-        self._session_lock = asyncio.Lock()  # Блокировка для безопасной работы с сессией
+        self._task_sessions: Dict[int, AsyncSession] = {}  # Отдельные сессии для каждой задачи
+        self._recovery_tasks: Dict[int, asyncio.Task] = {}  # Задачи восстановления
+        self._session_lock = asyncio.Lock()  # Блокировка для безопасной работы с основной сессией
         # Используем отдельный сервис парсинга с Redis для кэширования
         self.parsing_service = parsing_service or ParsingService(proxy_manager=proxy_manager, redis_service=redis_service)
     
@@ -248,24 +254,113 @@ class MonitoringService:
             task_id = task.id
             task_name = task.name
             
-            logger.info(f"🚀 Запущен мониторинг для задачи: {task_name} (ID: {task_id})")
-            logger.info(f"   📋 Интервал проверки: {task.check_interval} сек")
-            logger.info(f"   ✅ Задача активна: {task.is_active}")
-            logger.info(f"   🔌 Redis доступен: {self.redis_service is not None and (self.redis_service.is_connected() if self.redis_service else False)}")
-            if task.next_check:
-                logger.info(f"   ⏰ Следующая проверка: {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-            else:
-                logger.info(f"   ⏰ Первая проверка будет выполнена сразу")
-            
-            iteration = 0
-            while self._running and task.is_active:
+            # ВАЖНО: Создаем отдельную сессию БД для этой корутины
+            # Это предотвращает ошибки "concurrent operations are not permitted"
+            task_session: Optional[AsyncSession] = None
+            if self.db_manager:
                 try:
-                    # Периодически обновляем задачу из БД для проверки актуального статуса
-                    if iteration % 6 == 0:  # Каждые 6 итераций (примерно минута)
+                    task_session = await self.db_manager.get_session()
+                    self._task_sessions[task_id] = task_session
+                    logger.info(f"✅ Задача {task_id}: Создана отдельная сессия БД для мониторинга")
+                except Exception as e:
+                    logger.error(f"❌ Задача {task_id}: Не удалось создать сессию БД: {e}")
+                    # Fallback на основную сессию
+                    task_session = self.db_session
+            else:
+                # Fallback: используем основную сессию (старый режим)
+                task_session = self.db_session
+                logger.warning(f"⚠️ Задача {task_id}: Используется общая сессия БД (рекомендуется передать db_manager)")
+            
+            try:
+                logger.info(f"🚀 Запущен мониторинг для задачи: {task_name} (ID: {task_id})")
+                logger.info(f"   📋 Интервал проверки: {task.check_interval} сек")
+                logger.info(f"   ✅ Задача активна: {task.is_active}")
+                logger.info(f"   🔌 Redis доступен: {self.redis_service is not None and (self.redis_service.is_connected() if self.redis_service else False)}")
+                if task.next_check:
+                    logger.info(f"   ⏰ Следующая проверка: {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+                else:
+                    logger.info(f"   ⏰ Первая проверка будет выполнена сразу")
+                
+                iteration = 0
+                consecutive_errors = 0  # Счетчик последовательных ошибок
+                MAX_CONSECUTIVE_ERRORS = 5  # Максимум ошибок подряд перед остановкой
+                
+                while self._running:
+                    try:
+                        # Периодически обновляем задачу из БД для проверки актуального статуса
+                        if iteration % 6 == 0:  # Каждые 6 итераций (примерно минута)
+                            try:
+                                # Проверяем, существует ли задача в БД используя отдельную сессию
+                                from sqlalchemy import select
+                                result = await task_session.execute(
+                                    select(MonitoringTask).where(MonitoringTask.id == task_id)
+                                )
+                                db_task = result.scalar_one_or_none()
+                                
+                                if not db_task:
+                                    logger.info(f"🗑️ Задача {task_id}: Удалена из БД, останавливаем мониторинг")
+                                    break
+                                elif not db_task.is_active:
+                                    logger.info(f"🛑 Задача {task_id}: Деактивирована, останавливаем мониторинг")
+                                    break
+                                else:
+                                    # Обновляем объект в памяти
+                                    task.is_active = db_task.is_active
+                                    task.check_interval = db_task.check_interval
+                                    task.next_check = db_task.next_check  # Синхронизируем next_check из БД
+                                consecutive_errors = 0  # Сброс счетчика при успешной проверке
+                            except Exception as e:
+                                consecutive_errors += 1
+                                logger.error(f"❌ Ошибка при проверке статуса задачи {task_id}: {e}")
+                                import traceback
+                                logger.debug(f"Traceback: {traceback.format_exc()}")
+                                
+                                # Если слишком много ошибок подряд - останавливаем мониторинг
+                                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                                    logger.error(f"❌ Задача {task_id}: Превышен лимит ошибок ({MAX_CONSECUTIVE_ERRORS}), останавливаем мониторинг")
+                                    # Обновляем next_check перед остановкой, чтобы задача могла быть восстановлена
+                                    try:
+                                        await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                                    except Exception:
+                                        pass
+                                    break
+                                
+                                # При ошибке обновляем next_check и продолжаем работу
+                                try:
+                                    await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                                except Exception as update_error:
+                                    logger.error(f"❌ Задача {task_id}: Не удалось обновить next_check после ошибки: {update_error}")
+                                
+                                # Ждем перед следующей попыткой
+                                await asyncio.sleep(min(task.check_interval, 60))
+                                continue
+                        
+                        iteration += 1
+                        
+                        # Проверяем, не пора ли проверять
+                        now = datetime.now()
+                        
+                        # Если next_check установлен и еще не наступил - ждем
+                        if task.next_check and now < task.next_check:
+                            wait_time = (task.next_check - now).total_seconds()
+                            if wait_time > 0:
+                                logger.debug(f"⏳ Задача {task_id}: Ждем до следующей проверки ({wait_time:.1f} сек)")
+                                await asyncio.sleep(min(wait_time, 60))  # Максимум 60 секунд
+                                continue
+                        
+                        # Если next_check в прошлом или не установлен - выполняем проверку сразу
+                        if task.next_check and now >= task.next_check:
+                            logger.info(f"⏰ Задача {task_id}: Время проверки наступило (next_check был: {task.next_check.strftime('%Y-%m-%d %H:%M:%S')})")
+                        elif not task.next_check:
+                            logger.info(f"🆕 Задача {task_id}: Первая проверка (next_check не установлен)")
+                        
+                        logger.info(f"🔍 Задача {task_id}: Начинаем проверку (время: {now.strftime('%Y-%m-%d %H:%M:%S')})")
+                        
+                        # ВАЖНО: Проверяем, что задача еще существует и активна перед публикацией
+                        # Используем отдельную сессию для этой проверки
                         try:
-                            # Проверяем, существует ли задача в БД
                             from sqlalchemy import select
-                            result = await self.db_session.execute(
+                            result = await task_session.execute(
                                 select(MonitoringTask).where(MonitoringTask.id == task_id)
                             )
                             db_task = result.scalar_one_or_none()
@@ -280,125 +375,89 @@ class MonitoringService:
                                 # Обновляем объект в памяти
                                 task.is_active = db_task.is_active
                                 task.check_interval = db_task.check_interval
+                                task.next_check = db_task.next_check  # Синхронизируем next_check из БД
                         except Exception as e:
-                            logger.error(f"❌ Ошибка при проверке статуса задачи {task_id}: {e}")
-                            # Если не можем проверить статус, останавливаем мониторинг
-                            break
-                    
-                    iteration += 1
-                    
-                    # Проверяем, не пора ли проверять
-                    now = datetime.now()
-                    
-                    # Если next_check установлен и еще не наступил - ждем
-                    if task.next_check and now < task.next_check:
-                        wait_time = (task.next_check - now).total_seconds()
-                        if wait_time > 0:
-                            logger.debug(f"⏳ Задача {task_id}: Ждем до следующей проверки ({wait_time:.1f} сек)")
-                            await asyncio.sleep(min(wait_time, 60))  # Максимум 60 секунд
-                            continue
-                    
-                    # Если next_check в прошлом или не установлен - выполняем проверку сразу
-                    if task.next_check and now >= task.next_check:
-                        logger.info(f"⏰ Задача {task_id}: Время проверки наступило (next_check был: {task.next_check.strftime('%Y-%m-%d %H:%M:%S')})")
-                    elif not task.next_check:
-                        logger.info(f"🆕 Задача {task_id}: Первая проверка (next_check не установлен)")
-                    
-                    logger.info(f"🔍 Задача {task_id}: Начинаем проверку (время: {now.strftime('%Y-%m-%d %H:%M:%S')})")
-                    
-                    # ВАЖНО: Проверяем, что задача еще существует и активна перед публикацией
-                    async with self._session_lock:
-                        try:
-                            from sqlalchemy import select
-                            result = await self.db_session.execute(
-                                select(MonitoringTask).where(MonitoringTask.id == task_id)
-                            )
-                            db_task = result.scalar_one_or_none()
-                            
-                            if not db_task:
-                                logger.info(f"🗑️ Задача {task_id}: Удалена из БД, останавливаем мониторинг")
-                                break
-                            elif not db_task.is_active:
-                                logger.info(f"🛑 Задача {task_id}: Деактивирована, останавливаем мониторинг")
-                                break
-                            else:
-                                # Обновляем объект в памяти
-                                task.is_active = db_task.is_active
-                                task.check_interval = db_task.check_interval
-                        except Exception as e:
+                            consecutive_errors += 1
                             logger.error(f"❌ Ошибка при проверке статуса задачи {task_id} перед публикацией: {e}")
-                            # Если не можем проверить статус, пропускаем эту итерацию
+                            import traceback
+                            logger.debug(f"Traceback: {traceback.format_exc()}")
+                            
+                            # Если слишком много ошибок подряд - останавливаем мониторинг
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                                logger.error(f"❌ Задача {task_id}: Превышен лимит ошибок ({MAX_CONSECUTIVE_ERRORS}), останавливаем мониторинг")
+                                try:
+                                    await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                                except Exception:
+                                    pass
+                                break
+                            
+                            # При ошибке обновляем next_check и пропускаем итерацию
+                            try:
+                                await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                            except Exception as update_error:
+                                logger.error(f"❌ Задача {task_id}: Не удалось обновить next_check после ошибки: {update_error}")
+                            
                             await asyncio.sleep(min(task.check_interval, 60))
                             continue
-                    
-                    # Если Redis доступен, публикуем задачу в Redis для Parsing Worker
-                    if self.redis_service and self.redis_service.is_connected():
-                        try:
-                            # ВАЖНО: Проверяем, не выполняется ли уже парсинг для этой задачи
-                            task_running_key = f"parsing_task_running:{task_id}"
-                            is_running = None
-                            task_start_time = None
+                        
+                        # Если Redis доступен, публикуем задачу в Redis для Parsing Worker
+                        if self.redis_service and self.redis_service.is_connected():
                             try:
-                                if self.redis_service._client:
-                                    flag_value = await self.redis_service._client.get(task_running_key)
-                                    is_running = flag_value is not None
-                                    
-                                    # Пытаемся извлечь время начала выполнения из значения флага
-                                    if flag_value:
-                                        try:
-                                            # Значение флага содержит ISO timestamp времени начала выполнения
-                                            task_start_time = datetime.fromisoformat(flag_value.decode('utf-8') if isinstance(flag_value, bytes) else flag_value)
-                                        except (ValueError, AttributeError):
-                                            # Если не удалось распарсить timestamp, используем TTL для оценки
-                                            ttl = await self.redis_service._client.ttl(task_running_key)
-                                            if ttl > 0:
-                                                # Флаг устанавливается с TTL=3600 (60 минут)
-                                                elapsed_seconds = 3600 - ttl
-                                                task_start_time = now - timedelta(seconds=elapsed_seconds)
-                            except Exception as e:
-                                logger.debug(f"⚠️ Задача {task_id}: Ошибка при проверке флага выполнения: {e}")
-                            
-                            if is_running:
-                                # Проверяем, не зависла ли задача (выполняется слишком долго)
-                                STUCK_TASK_TIMEOUT = 10 * 60  # 10 минут - максимальное время выполнения задачи
-                                
-                                if task_start_time:
-                                    elapsed_time = (now - task_start_time).total_seconds()
-                                    if elapsed_time > STUCK_TASK_TIMEOUT:
-                                        logger.warning(f"⚠️ Задача {task_id}: Обнаружена ЗАВИСШАЯ задача!")
-                                        logger.warning(f"   ⏱️ Время выполнения: {elapsed_time/60:.1f} минут (превышен лимит {STUCK_TASK_TIMEOUT/60:.0f} минут)")
-                                        logger.warning(f"   🔄 Удаляем зависший флаг и перезапускаем задачу...")
+                                # ВАЖНО: Проверяем, не выполняется ли уже парсинг для этой задачи
+                                task_running_key = f"parsing_task_running:{task_id}"
+                                is_running = None
+                                task_start_time = None
+                                try:
+                                    if self.redis_service._client:
+                                        flag_value = await self.redis_service._client.get(task_running_key)
+                                        is_running = flag_value is not None
                                         
-                                        try:
-                                            # Удаляем зависший флаг
-                                            if self.redis_service._client:
-                                                deleted = await self.redis_service._client.delete(task_running_key)
-                                                if deleted:
-                                                    logger.info(f"✅ Задача {task_id}: Зависший флаг удален, задача будет перезапущена")
-                                                else:
-                                                    logger.warning(f"⚠️ Задача {task_id}: Не удалось удалить зависший флаг (возможно, уже удален)")
-                                        except Exception as delete_error:
-                                            logger.error(f"❌ Задача {task_id}: Ошибка при удалении зависшего флага: {delete_error}")
-                                        
-                                        # Продолжаем выполнение - задача будет опубликована в очередь
-                                    else:
-                                        logger.warning(f"⏸️ Задача {task_id}: Парсинг уже выполняется ({elapsed_time/60:.1f} минут), пропускаем эту проверку")
-                                        # Обновляем время следующей проверки, но не публикуем задачу
-                                        async with self._session_lock:
+                                        # Пытаемся извлечь время начала выполнения из значения флага
+                                        if flag_value:
                                             try:
-                                                task.next_check = now + timedelta(seconds=task.check_interval)
-                                                await self.db_session.commit()
-                                                logger.info(f"⏰ Задача {task_id}: Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-                                            except Exception as commit_error:
-                                                logger.error(f"❌ Задача {task_id}: Ошибка при обновлении next_check: {commit_error}")
-                                                try:
-                                                    await self.db_session.rollback()
-                                                except Exception:
-                                                    pass
-                                        # Ждем до следующей проверки
-                                        logger.debug(f"💤 Задача {task_id}: Ожидание {task.check_interval} сек до следующей проверки")
-                                        await asyncio.sleep(task.check_interval)
-                                        continue
+                                                # Значение флага содержит ISO timestamp времени начала выполнения
+                                                task_start_time = datetime.fromisoformat(flag_value.decode('utf-8') if isinstance(flag_value, bytes) else flag_value)
+                                            except (ValueError, AttributeError):
+                                                # Если не удалось распарсить timestamp, используем TTL для оценки
+                                                ttl = await self.redis_service._client.ttl(task_running_key)
+                                                if ttl > 0:
+                                                    # Флаг устанавливается с TTL=3600 (60 минут)
+                                                    elapsed_seconds = 3600 - ttl
+                                                    task_start_time = now - timedelta(seconds=elapsed_seconds)
+                                except Exception as e:
+                                    logger.debug(f"⚠️ Задача {task_id}: Ошибка при проверке флага выполнения: {e}")
+                                
+                                if is_running:
+                                    # Проверяем, не зависла ли задача (выполняется слишком долго)
+                                    STUCK_TASK_TIMEOUT = 10 * 60  # 10 минут - максимальное время выполнения задачи
+                                    
+                                    if task_start_time:
+                                        elapsed_time = (now - task_start_time).total_seconds()
+                                        if elapsed_time > STUCK_TASK_TIMEOUT:
+                                            logger.warning(f"⚠️ Задача {task_id}: Обнаружена ЗАВИСШАЯ задача!")
+                                            logger.warning(f"   ⏱️ Время выполнения: {elapsed_time/60:.1f} минут (превышен лимит {STUCK_TASK_TIMEOUT/60:.0f} минут)")
+                                            logger.warning(f"   🔄 Удаляем зависший флаг и перезапускаем задачу...")
+                                            
+                                            try:
+                                                # Удаляем зависший флаг
+                                                if self.redis_service._client:
+                                                    deleted = await self.redis_service._client.delete(task_running_key)
+                                                    if deleted:
+                                                        logger.info(f"✅ Задача {task_id}: Зависший флаг удален, задача будет перезапущена")
+                                                    else:
+                                                        logger.warning(f"⚠️ Задача {task_id}: Не удалось удалить зависший флаг (возможно, уже удален)")
+                                            except Exception as delete_error:
+                                                logger.error(f"❌ Задача {task_id}: Ошибка при удалении зависшего флага: {delete_error}")
+                                            
+                                            # Продолжаем выполнение - задача будет опубликована в очередь
+                                        else:
+                                            logger.warning(f"⏸️ Задача {task_id}: Парсинг уже выполняется ({elapsed_time/60:.1f} минут), пропускаем эту проверку")
+                                            # Обновляем время следующей проверки, но не публикуем задачу
+                                            await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                                            # Ждем до следующей проверки
+                                            logger.debug(f"💤 Задача {task_id}: Ожидание {task.check_interval} сек до следующей проверки")
+                                            await asyncio.sleep(task.check_interval)
+                                            continue
                                 else:
                                     # Не удалось определить время начала, но флаг существует
                                     # Проверяем TTL флага для оценки времени выполнения
@@ -421,17 +480,7 @@ class MonitoringService:
                                                 else:
                                                     logger.warning(f"⏸️ Задача {task_id}: Парсинг уже выполняется (~{elapsed_seconds/60:.1f} минут, TTL={ttl}с), пропускаем эту проверку")
                                                     # Обновляем время следующей проверки, но не публикуем задачу
-                                                    async with self._session_lock:
-                                                        try:
-                                                            task.next_check = now + timedelta(seconds=task.check_interval)
-                                                            await self.db_session.commit()
-                                                            logger.info(f"⏰ Задача {task_id}: Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-                                                        except Exception as commit_error:
-                                                            logger.error(f"❌ Задача {task_id}: Ошибка при обновлении next_check: {commit_error}")
-                                                            try:
-                                                                await self.db_session.rollback()
-                                                            except Exception:
-                                                                pass
+                                                    await self._update_next_check_safe(task_id, task_session, task.check_interval)
                                                     # Ждем до следующей проверки
                                                     logger.debug(f"💤 Задача {task_id}: Ожидание {task.check_interval} сек до следующей проверки")
                                                     await asyncio.sleep(task.check_interval)
@@ -446,96 +495,214 @@ class MonitoringService:
                                         # В случае ошибки, пропускаем задачу
                                         logger.warning(f"⏸️ Задача {task_id}: Парсинг уже выполняется (время начала неизвестно, ошибка проверки TTL), пропускаем эту проверку")
                                         # Обновляем время следующей проверки, но не публикуем задачу
-                                    async with self._session_lock:
-                                        try:
-                                            task.next_check = now + timedelta(seconds=task.check_interval)
-                                            await self.db_session.commit()
-                                            logger.info(f"⏰ Задача {task_id}: Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-                                        except Exception as commit_error:
-                                            logger.error(f"❌ Задача {task_id}: Ошибка при обновлении next_check: {commit_error}")
-                                            try:
-                                                await self.db_session.rollback()
-                                            except Exception:
-                                                pass
+                                        await self._update_next_check_safe(task_id, task_session, task.check_interval)
                                     # Ждем до следующей проверки
                                     logger.debug(f"💤 Задача {task_id}: Ожидание {task.check_interval} сек до следующей проверки")
                                     await asyncio.sleep(task.check_interval)
                                     continue
-                            
-                            task_data = {
-                                "type": "parsing_task",
-                                "task_id": task_id,
-                                "filters_json": task.filters_json,  # Уже dict (JSONB)
-                                "item_name": task.item_name,
-                                "appid": task.appid,
-                                "currency": task.currency
-                            }
-                            logger.info(f"📤 Задача {task_id}: Добавляем задачу в Redis очередь 'parsing_tasks' (push_to_queue)")
-                            logger.debug(f"   Данные задачи: task_id={task_id}, item_name={task.item_name}, appid={task.appid}")
-                            # Используем очередь вместо pub/sub - задача будет удалена после обработки
-                            await self.redis_service.push_to_queue("parsing_tasks", task_data)
-                            logger.info(f"✅ Задача {task_id}: Успешно добавлена в очередь Redis")
-                            # ВАЖНО: НЕ обновляем next_check сразу - пусть обновится только после завершения обработки
-                            # или при следующей проверке (если парсинг еще выполняется)
-                            # Это предотвращает планирование новой проверки, пока текущая еще не завершена
-                            logger.debug(f"⏳ Задача {task_id}: Задача добавлена в очередь, next_check будет обновлен после завершения обработки")
-                        except Exception as e:
-                            logger.error(f"❌ Задача {task_id}: Ошибка публикации в Redis: {e}")
-                            import traceback
-                            logger.debug(f"Traceback: {traceback.format_exc()}")
+                                
+                                task_data = {
+                                    "type": "parsing_task",
+                                    "task_id": task_id,
+                                    "filters_json": task.filters_json,  # Уже dict (JSONB)
+                                    "item_name": task.item_name,
+                                    "appid": task.appid,
+                                    "currency": task.currency
+                                }
+                                logger.info(f"📤 Задача {task_id}: Добавляем задачу в Redis очередь 'parsing_tasks' (push_to_queue)")
+                                logger.debug(f"   Данные задачи: task_id={task_id}, item_name={task.item_name}, appid={task.appid}")
+                                # Используем очередь вместо pub/sub - задача будет удалена после обработки
+                                await self.redis_service.push_to_queue("parsing_tasks", task_data)
+                                logger.info(f"✅ Задача {task_id}: Успешно добавлена в очередь Redis")
+                                # ВАЖНО: НЕ обновляем next_check сразу - пусть обновится только после завершения обработки
+                                # или при следующей проверке (если парсинг еще выполняется)
+                                # Это предотвращает планирование новой проверки, пока текущая еще не завершена
+                                logger.debug(f"⏳ Задача {task_id}: Задача добавлена в очередь, next_check будет обновлен после завершения обработки")
+                            except Exception as e:
+                                logger.error(f"❌ Задача {task_id}: Ошибка публикации в Redis: {e}")
+                                import traceback
+                                logger.debug(f"Traceback: {traceback.format_exc()}")
+                                # Fallback: выполняем проверку напрямую
+                                logger.info(f"🔄 Задача {task_id}: Выполняем проверку напрямую (fallback)")
+                                await self._check_task(task, task_session)
+                                # При fallback обновляем next_check после завершения проверки
+                                await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                        else:
                             # Fallback: выполняем проверку напрямую
-                            logger.info(f"🔄 Задача {task_id}: Выполняем проверку напрямую (fallback)")
-                            await self._check_task(task)
+                            redis_status = "не инициализирован" if not self.redis_service else "не подключен"
+                            logger.warning(f"⚠️ Задача {task_id}: Redis {redis_status}, выполняем проверку напрямую")
+                            await self._check_task(task, task_session)
                             # При fallback обновляем next_check после завершения проверки
-                            async with self._session_lock:
-                                try:
-                                    task.next_check = now + timedelta(seconds=task.check_interval)
-                                    await self.db_session.commit()
-                                    logger.info(f"⏰ Задача {task_id}: Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-                                except Exception as commit_error:
-                                    logger.error(f"❌ Задача {task_id}: Ошибка при обновлении next_check: {commit_error}")
-                                    try:
-                                        await self.db_session.rollback()
-                                    except Exception:
-                                        pass
-                    else:
-                        # Fallback: выполняем проверку напрямую
-                        redis_status = "не инициализирован" if not self.redis_service else "не подключен"
-                        logger.warning(f"⚠️ Задача {task_id}: Redis {redis_status}, выполняем проверку напрямую")
-                        await self._check_task(task)
-                        # При fallback обновляем next_check после завершения проверки
-                        async with self._session_lock:
+                            await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                    
+                        # Ждем до следующей проверки
+                        logger.debug(f"💤 Задача {task_id}: Ожидание {task.check_interval} сек до следующей проверки")
+                        await asyncio.sleep(task.check_interval)
+                    
+                    except asyncio.CancelledError:
+                        logger.info(f"Мониторинг задачи {task_id} остановлен")
+                        break
+                    except Exception as e:
+                        consecutive_errors += 1
+                        # Используем сохраненный task_id вместо task.id, чтобы избежать проблем с ORM после rollback
+                        logger.error(f"Ошибка в мониторинге задачи {task_id}: {e}")
+                        import traceback
+                        logger.debug(f"Traceback: {traceback.format_exc()}")
+                        
+                        # Пытаемся откатить транзакцию, если она в плохом состоянии
+                        try:
+                            await task_session.rollback()
+                        except Exception:
+                            pass
+                        
+                        # Если слишком много ошибок подряд - останавливаем мониторинг
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            logger.error(f"❌ Задача {task_id}: Превышен лимит ошибок ({MAX_CONSECUTIVE_ERRORS}), останавливаем мониторинг")
                             try:
-                                task.next_check = now + timedelta(seconds=task.check_interval)
-                                await self.db_session.commit()
-                                logger.info(f"⏰ Задача {task_id}: Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-                            except Exception as commit_error:
-                                logger.error(f"❌ Задача {task_id}: Ошибка при обновлении next_check: {commit_error}")
-                                try:
-                                    await self.db_session.rollback()
-                                except Exception:
-                                    pass
-                    
-                    # Ждем до следующей проверки
-                    logger.debug(f"💤 Задача {task_id}: Ожидание {task.check_interval} сек до следующей проверки")
-                    await asyncio.sleep(task.check_interval)
-                    
-                except asyncio.CancelledError:
-                    logger.info(f"Мониторинг задачи {task_id} остановлен")
-                    break
-                except Exception as e:
-                    # Используем сохраненный task_id вместо task.id, чтобы избежать проблем с ORM после rollback
-                    logger.error(f"Ошибка в мониторинге задачи {task_id}: {e}")
-                    import traceback
-                    logger.debug(f"Traceback: {traceback.format_exc()}")
-                    # Пытаемся откатить транзакцию, если она в плохом состоянии
+                                await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                            except Exception:
+                                pass
+                            break
+                        
+                        # Обновляем next_check и ждем перед повтором
+                        try:
+                            await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(60)  # Ждем перед повтором
+            finally:
+                # Закрываем сессию задачи при выходе из цикла
+                if task_session and task_session != self.db_session:
                     try:
-                        await self.db_session.rollback()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(60)  # Ждем перед повтором
+                        await task_session.close()
+                        logger.info(f"✅ Задача {task_id}: Сессия БД закрыта")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Задача {task_id}: Ошибка при закрытии сессии: {e}")
+                    finally:
+                        # Удаляем сессию из словаря
+                        self._task_sessions.pop(task_id, None)
+                
+                # Если мониторинг остановился из-за ошибки, запускаем восстановление
+                if self._running and task_id not in self._recovery_tasks:
+                    logger.warning(f"🔄 Задача {task_id}: Мониторинг остановился, запускаем восстановление...")
+                    await self._start_task_recovery(task_id)
         
         self._tasks[task.id] = asyncio.create_task(monitor_loop())
+    
+    async def _update_next_check_safe(self, task_id: int, session: AsyncSession, check_interval: int):
+        """
+        Безопасно обновляет next_check для задачи.
+        
+        Args:
+            task_id: ID задачи
+            session: Сессия БД для использования
+            check_interval: Интервал проверки в секундах
+        """
+        try:
+            now = datetime.now()
+            next_check = now + timedelta(seconds=check_interval)
+            
+            # Обновляем через UPDATE запрос, чтобы избежать проблем с ORM
+            await session.execute(
+                update(MonitoringTask)
+                .where(MonitoringTask.id == task_id)
+                .values(next_check=next_check)
+            )
+            await session.commit()
+            logger.info(f"⏰ Задача {task_id}: Следующая проверка в {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception as e:
+            logger.error(f"❌ Задача {task_id}: Ошибка при обновлении next_check: {e}")
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+    
+    async def _start_task_recovery(self, task_id: int):
+        """
+        Запускает механизм восстановления для остановившейся задачи.
+        
+        Args:
+            task_id: ID задачи для восстановления
+        """
+        if task_id in self._recovery_tasks:
+            logger.debug(f"🔄 Задача {task_id}: Восстановление уже запущено")
+            return
+        
+        async def recovery_loop():
+            """Цикл восстановления задачи."""
+            recovery_delay = 60  # Начальная задержка перед восстановлением (секунды)
+            max_delay = 600  # Максимальная задержка (10 минут)
+            max_attempts = 10  # Максимум попыток восстановления
+            
+            attempt = 0
+            while self._running and attempt < max_attempts:
+                try:
+                    await asyncio.sleep(recovery_delay)
+                    attempt += 1
+                    
+                    # Проверяем, что задача все еще активна
+                    session = None
+                    try:
+                        if self.db_manager:
+                            session = await self.db_manager.get_session()
+                        else:
+                            session = self.db_session
+                        
+                        result = await session.execute(
+                            select(MonitoringTask).where(MonitoringTask.id == task_id)
+                        )
+                        task = result.scalar_one_or_none()
+                        
+                        if not task:
+                            logger.info(f"🔄 Задача {task_id}: Задача удалена, прекращаем восстановление")
+                            break
+                        
+                        if not task.is_active:
+                            logger.info(f"🔄 Задача {task_id}: Задача деактивирована, прекращаем восстановление")
+                            break
+                        
+                        # Проверяем, не запущен ли уже мониторинг
+                        if task_id in self._tasks:
+                            task_obj = self._tasks[task_id]
+                            if not task_obj.done():
+                                logger.info(f"🔄 Задача {task_id}: Мониторинг уже запущен, прекращаем восстановление")
+                                break
+                            else:
+                                # Задача завершилась, удаляем её
+                                del self._tasks[task_id]
+                        
+                        logger.info(f"🔄 Задача {task_id}: Попытка восстановления #{attempt}/{max_attempts}")
+                        
+                        # Перезапускаем мониторинг
+                        await self._start_task_monitoring(task)
+                        logger.info(f"✅ Задача {task_id}: Мониторинг успешно восстановлен")
+                        break
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Задача {task_id}: Ошибка при восстановлении (попытка {attempt}): {e}")
+                        # Увеличиваем задержку экспоненциально
+                        recovery_delay = min(recovery_delay * 2, max_delay)
+                    finally:
+                        if session and session != self.db_session:
+                            try:
+                                await session.close()
+                            except Exception:
+                                pass
+                        
+                except asyncio.CancelledError:
+                    logger.info(f"🔄 Задача {task_id}: Восстановление отменено")
+                    break
+                except Exception as e:
+                    logger.error(f"❌ Задача {task_id}: Критическая ошибка в цикле восстановления: {e}")
+                    recovery_delay = min(recovery_delay * 2, max_delay)
+            
+            # Удаляем задачу восстановления из словаря
+            self._recovery_tasks.pop(task_id, None)
+            if attempt >= max_attempts:
+                logger.error(f"❌ Задача {task_id}: Превышен лимит попыток восстановления ({max_attempts})")
+        
+        self._recovery_tasks[task_id] = asyncio.create_task(recovery_loop())
+        logger.info(f"🔄 Задача {task_id}: Запущено восстановление")
     
     async def _stop_task_monitoring(self, task_id: int):
         """Останавливает мониторинг для задачи."""
@@ -547,14 +714,37 @@ class MonitoringService:
                 pass
             del self._tasks[task_id]
             logger.info(f"Остановлен мониторинг для задачи {task_id}")
+        
+        # Останавливаем восстановление, если оно запущено
+        if task_id in self._recovery_tasks:
+            self._recovery_tasks[task_id].cancel()
+            try:
+                await self._recovery_tasks[task_id]
+            except asyncio.CancelledError:
+                pass
+            del self._recovery_tasks[task_id]
+        
+        # Закрываем сессию задачи, если она существует
+        if task_id in self._task_sessions:
+            session = self._task_sessions[task_id]
+            if session != self.db_session:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+            del self._task_sessions[task_id]
     
-    async def _check_task(self, task: MonitoringTask):
+    async def _check_task(self, task: MonitoringTask, session: Optional[AsyncSession] = None):
         """
         Выполняет одну проверку для задачи.
         
         Args:
             task: Задача мониторинга
+            session: Сессия БД для использования (если None, используется self.db_session)
         """
+        if session is None:
+            session = self.db_session
+        
         logger.debug(f"Проверка задачи: {task.name} (ID: {task.id})")
         
         try:
@@ -599,14 +789,14 @@ class MonitoringService:
                         logger.info(f"      ⚠️ Предмет уже существует (дубликат)")
                 
                 task.items_found += found_count
-                await self.db_session.commit()
+                await session.commit()
                 logger.info(f"✅ MonitoringService: Найдено и сохранено {found_count} предметов для задачи '{task.name}' (всего найдено: {task.items_found})")
                 
                 # Отправляем уведомления (только для новых предметов, которые еще не отправлялись)
                 if found_count > 0:
                     # Получаем только те предметы, которые еще не отправлялись
                     from sqlalchemy import select
-                    found_items_result = await self.db_session.execute(
+                    found_items_result = await session.execute(
                         select(FoundItem)
                         .where(
                             (FoundItem.task_id == task.id) &
@@ -641,7 +831,7 @@ class MonitoringService:
                                         await self.notification_callback(found_item, task)
                                         found_item.notification_sent = True
                                         found_item.notification_sent_at = datetime.now()
-                                        await self.db_session.commit()
+                                        await session.commit()
                                     except Exception as e2:
                                         logger.error(f"Ошибка отправки уведомления через callback: {e2}")
                     elif self.notification_callback:
@@ -652,7 +842,7 @@ class MonitoringService:
                                 # Отмечаем как отправленное сразу после успешной отправки
                                 found_item.notification_sent = True
                                 found_item.notification_sent_at = datetime.now()
-                                await self.db_session.commit()
+                                await session.commit()
                             except Exception as e:
                                 logger.error(f"Ошибка отправки уведомления: {e}")
             else:
@@ -663,7 +853,7 @@ class MonitoringService:
             
             task.total_checks += 1
             task.last_check = datetime.now()
-            await self.db_session.commit()
+            await session.commit()
                 
         except Exception as e:
             logger.error(f"Ошибка при проверке задачи {task.id}: {e}")
@@ -687,9 +877,12 @@ class MonitoringService:
         parsed_data = item.get('parsed_data', {})
         item_name = item.get('name', task.item_name)
         
+        # Используем сессию задачи, если доступна, иначе основную
+        session = self._task_sessions.get(task.id, self.db_session)
+        
         # Проверяем дубликаты (по названию и цене)
         from sqlalchemy import select
-        existing = await self.db_session.execute(
+        existing = await session.execute(
             select(FoundItem).where(
                 FoundItem.task_id == task.id,
                 FoundItem.item_name == item_name,
@@ -712,9 +905,9 @@ class MonitoringService:
             notification_sent=False
         )
         
-        self.db_session.add(found_item)
-        await self.db_session.commit()
-        await self.db_session.refresh(found_item)
+        session.add(found_item)
+        await session.commit()
+        await session.refresh(found_item)
         
         logger.info(f"💾 Сохранен найденный предмет: {found_item.item_name} (${found_item.price:.2f})")
         return True
@@ -750,6 +943,24 @@ class MonitoringService:
         # Останавливаем все задачи
         for task_id in list(self._tasks.keys()):
             await self._stop_task_monitoring(task_id)
+        
+        # Останавливаем все задачи восстановления
+        for task_id in list(self._recovery_tasks.keys()):
+            self._recovery_tasks[task_id].cancel()
+            try:
+                await self._recovery_tasks[task_id]
+            except asyncio.CancelledError:
+                pass
+            del self._recovery_tasks[task_id]
+        
+        # Закрываем все сессии задач
+        for task_id, session in list(self._task_sessions.items()):
+            if session != self.db_session:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+            del self._task_sessions[task_id]
     
     async def get_statistics(self) -> Dict[str, Any]:
         """Получает статистику мониторинга."""

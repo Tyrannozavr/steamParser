@@ -116,7 +116,8 @@ class BotApplication:
             self.db_session,
             self.proxy_manager,
             notification_callback=self.telegram_bot.send_notification if not Config.REDIS_ENABLED else None,
-            redis_service=self.redis_service
+            redis_service=self.redis_service,
+            db_manager=self.db_manager  # Передаем db_manager для создания отдельных сессий в корутинах
         )
         
         # Устанавливаем ссылку на monitoring_service в боте
