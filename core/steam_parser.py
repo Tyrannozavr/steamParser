@@ -890,6 +890,22 @@ class SteamMarketParser(SteamAPIMethods, SteamHelperMethods):
                 async def process_item(item: Dict[str, Any], idx: int) -> list[Dict[str, Any]]:
                     """Обрабатывает один предмет с использованием отдельного прокси."""
                     async with semaphore:
+                        # ВАЖНО: Проверяем статус задачи перед началом обработки предмета
+                        if self._current_task:
+                            try:
+                                from sqlalchemy import select
+                                from core import MonitoringTask
+                                if self._current_db_session:
+                                    result = await self._current_db_session.execute(
+                                        select(MonitoringTask).where(MonitoringTask.id == self._current_task.id)
+                                    )
+                                    db_task = result.scalar_one_or_none()
+                                    if db_task and not db_task.is_active:
+                                        logger.info(f"🛑 Задача {self._current_task.id} деактивирована, пропускаем предмет {idx + 1}")
+                                        return None
+                            except Exception as e:
+                                logger.warning(f"⚠️ Ошибка при проверке статуса задачи: {e}")
+                        
                         # Получаем task_logger в начале функции
                         item_task_logger = get_task_logger()
                         
@@ -1001,6 +1017,22 @@ class SteamMarketParser(SteamAPIMethods, SteamHelperMethods):
                             # Создаем отдельный парсер для этого предмета с отдельным прокси
                             item_parser = self.__class__(proxy=item_proxy_url, timeout=30, redis_service=self.redis_service, proxy_manager=self.proxy_manager)
                             await item_parser._ensure_client()
+                            
+                            # ВАЖНО: Проверяем статус задачи перед парсингом страницы предмета
+                            if self._current_task:
+                                try:
+                                    from sqlalchemy import select
+                                    from core import MonitoringTask
+                                    if self._current_db_session:
+                                        result = await self._current_db_session.execute(
+                                            select(MonitoringTask).where(MonitoringTask.id == self._current_task.id)
+                                        )
+                                        db_task = result.scalar_one_or_none()
+                                        if db_task and not db_task.is_active:
+                                            logger.info(f"🛑 Задача {self._current_task.id} деактивирована, пропускаем парсинг предмета {hash_name}")
+                                            return None
+                                except Exception as e:
+                                    logger.warning(f"⚠️ Ошибка при проверке статуса задачи перед парсингом: {e}")
                             
                             try:
                                 logger.info(f"    🔍 Парсим ВСЕ лоты на странице предмета: {hash_name}")
