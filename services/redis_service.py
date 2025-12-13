@@ -224,7 +224,7 @@ class RedisService:
             logger.error(f"❌ RedisService.delete: Ошибка при удалении ключа '{key}': {e}")
             return False
     
-    async def lrange(self, key: str, start: int, end: int) -> List[str]:
+    async def lrange(self, key: str, start: int, end: int) -> list[str]:
         """
         Получает элементы из списка Redis.
         
