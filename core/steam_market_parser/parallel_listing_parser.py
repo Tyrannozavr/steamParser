@@ -129,11 +129,9 @@ async def parse_listings_parallel(
         log("error", f"   Traceback: {traceback.format_exc()}")
         return []
     
-    # Результаты (упорядоченный список)
-    results = [None] * len(pages_to_fetch)
+    # ВАЖНО: Результаты теперь сохраняются в Redis (без блокировки)
+    # В конце соберем все результаты из Redis
     matching_listings = []
-    lock = asyncio.Lock()
-    completed_pages_ref = [0]  # Используем список для передачи изменяемого значения
     max_retries = 3  # Максимум 3 попытки для страницы
     
     # Счетчики для диагностики
@@ -160,9 +158,6 @@ async def parse_listings_parallel(
                 available_proxies=available_proxies,
                 max_retries=max_retries,
                 total_pages=total_pages,
-                results=results,
-                lock=lock,
-                completed_pages_ref=completed_pages_ref,
                 task_start_times=task_start_times,
                 task_stages=task_stages,
                 log_func=log
@@ -201,14 +196,46 @@ async def parse_listings_parallel(
             for page_num, elapsed, stage in hung_pages:
                 log("error", f"   📋 Страница {page_num}: зависла на этапе '{stage}' уже {elapsed:.1f}с")
     
-    # Собираем результаты в правильном порядке
+    # Собираем результаты из Redis (быстро, без блокировки)
     # ВАЖНО: Если результаты уже обработаны в параллельном парсере (сразу после нахождения),
-    # то page_matching_listings будет пустым, и мы не вернем их для повторной обработки
-    for page_matching_listings in results:
-        if page_matching_listings:
-            matching_listings.extend(page_matching_listings)
-    
-    log("info", f"📊 Параллельный парсинг завершен: проверено {completed_pages_ref[0]}/{len(pages_to_fetch)} страниц, найдено {len(matching_listings)} подходящих лотов")
+    # то они не будут в Redis, так как process_item_result уже обработал их
+    try:
+        from .parallel_listing_redis_storage import get_all_results_from_redis, cleanup_redis_results
+        
+        log("info", f"📥 Собираем результаты из Redis...")
+        matching_listings = await get_all_results_from_redis(
+            redis_service=redis_service,
+            task_id=task.id if task else 0,
+            total_pages=total_pages,
+            log_func=log
+        )
+        
+        # Очищаем результаты из Redis после сбора
+        await cleanup_redis_results(
+            redis_service=redis_service,
+            task_id=task.id if task else 0,
+            total_pages=total_pages,
+            log_func=log
+        )
+        
+        # Получаем количество завершенных страниц из Redis
+        completed_count = 0
+        if task:
+            completed_key = f"parsing:completed:task_{task.id}"
+            try:
+                completed_str = await redis_service.get(completed_key)
+                if completed_str:
+                    completed_count = int(completed_str)
+                # Очищаем счетчик
+                await redis_service.delete(completed_key)
+            except Exception:
+                pass
+        
+        log("info", f"📊 Параллельный парсинг завершен: проверено {completed_count}/{len(pages_to_fetch)} страниц, найдено {len(matching_listings)} подходящих лотов")
+    except Exception as e:
+        log("error", f"❌ Ошибка при сборе результатов из Redis: {e}")
+        import traceback
+        log("error", f"   Traceback: {traceback.format_exc()}")
     if len(matching_listings) == 0:
         log("info", f"ℹ️ Список результатов пуст - все найденные предметы уже обработаны сразу (уведомления отправлены)")
     

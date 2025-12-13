@@ -236,9 +236,19 @@ class SteamHelperMethods:
                 logger.warning("⚠️ SteamMarketParser: Создаем HTTP клиент БЕЗ прокси (прямое подключение)")
             logger.debug(f"📋 User-Agent: {headers.get('User-Agent', 'Unknown')[:80]}...")
             
+            # ВАЖНО: Используем явный httpx.Timeout с отдельными таймаутами для надежности
+            # Это предотвращает зависание, если прокси завис после подключения
+            import httpx as httpx_lib
+            timeout_config = httpx_lib.Timeout(
+                timeout=self.timeout,  # Общий таймаут (fallback)
+                connect=min(10.0, self.timeout * 0.5),  # Подключение: быстрее (50% от общего, но не больше 10 сек)
+                read=min(self.timeout * 0.75, 15.0),  # Чтение: 75% от общего, но не больше 15 сек
+                write=5.0,  # Отправка: фиксированные 5 секунд (должно быть быстро)
+                pool=5.0  # Получение соединения из пула: 5 секунд
+            )
             self._client = httpx.AsyncClient(
                 proxy=self.proxy,
-                timeout=self.timeout,
+                timeout=timeout_config,  # Используем явный Timeout объект
                 headers=headers,
                 follow_redirects=True,
                 cookies={},

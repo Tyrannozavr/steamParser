@@ -28,9 +28,6 @@ async def process_page_from_queue(
     available_proxies: List,
     max_retries: int,
     total_pages: int,
-    results: List,
-    lock: asyncio.Lock,
-    completed_pages_ref: List[int],  # Используем список для передачи изменяемого значения
     task_start_times: Dict[int, datetime],
     task_stages: Dict[int, str],
     log_func: Callable
@@ -57,9 +54,6 @@ async def process_page_from_queue(
         available_proxies: Список доступных прокси
         max_retries: Максимальное количество попыток
         total_pages: Общее количество страниц
-        results: Список результатов (будет модифицирован)
-        lock: Блокировка для синхронизации
-        completed_pages_ref: Список с одним элементом [счетчик] для передачи изменяемого значения
         task_start_times: Словарь времен начала обработки страниц
         task_stages: Словарь текущих этапов обработки страниц
         log_func: Функция для логирования
@@ -180,8 +174,6 @@ async def process_page_from_queue(
                                 continue
                             else:
                                 log_func("error", f"    ❌ Воркер {worker_id}, страница {page_num}: Нет доступных прокси после {max_retries} попыток")
-                                async with lock:
-                                    completed_pages_ref[0] += 1
                                 break
                         
                         log_func("debug", f"    ✅ Воркер {worker_id}, страница {page_num}: Прокси ID={page_proxy.id} выбран за {proxy_select_time:.2f}с")
@@ -192,10 +184,11 @@ async def process_page_from_queue(
                         log_func("debug", f"    🔧 Воркер {worker_id}, страница {page_num}: Создаем HTTP клиент с прокси ID={page_proxy.id}...")
                         
                         from ..steam_http_client import SteamHttpClient
-                        temp_client = SteamHttpClient(proxy=page_proxy.url, timeout=30, proxy_manager=parser.proxy_manager)
+                        # Уменьшаем таймаут httpx до 20 секунд для быстрого переключения на другой прокси
+                        temp_client = SteamHttpClient(proxy=page_proxy.url, timeout=20, proxy_manager=parser.proxy_manager)
                         await temp_client._ensure_client()
                         
-                        temp_parser = parser.__class__(proxy=page_proxy.url, timeout=30, redis_service=parser.redis_service, proxy_manager=parser.proxy_manager)
+                        temp_parser = parser.__class__(proxy=page_proxy.url, timeout=20, redis_service=parser.redis_service, proxy_manager=parser.proxy_manager)
                         await temp_parser._ensure_client()
                         
                         client_create_time = (datetime.now() - client_create_start).total_seconds()
@@ -216,9 +209,11 @@ async def process_page_from_queue(
                         log_func("info", f"    📡 Воркер {worker_id}, страница {page_num}: Отправляем запрос через прокси ID={page_proxy.id} (start={page_start}, count={page_count})...")
                         
                         try:
+                            # Увеличиваем таймаут до 120 секунд, чтобы хватило на несколько попыток с переключением прокси
+                            # (каждая попытка до 20 сек + задержки между попытками)
                             render_data = await asyncio.wait_for(
                                 temp_parser._fetch_render_api(appid, hash_name, start=page_start, count=page_count),
-                                timeout=60.0
+                                timeout=120.0
                             )
                             request_time = (datetime.now() - request_start).total_seconds()
                             log_func("info", f"    ✅ Воркер {worker_id}, страница {page_num}: Запрос выполнен за {request_time:.2f}с")
@@ -238,8 +233,6 @@ async def process_page_from_queue(
                                 continue
                             else:
                                 log_func("error", f"    ❌ Воркер {worker_id}, страница {page_num}: Прокси ID={page_proxy.id} не вернул данные после {max_retries} попыток")
-                                async with lock:
-                                    completed_pages_ref[0] += 1
                                 break
                         
                         # Этап 5: Парсинг данных
@@ -259,8 +252,6 @@ async def process_page_from_queue(
                                 continue
                             else:
                                 log_func("error", f"    ❌ Воркер {worker_id}, страница {page_num}: results_html пуст после {max_retries} попыток")
-                                async with lock:
-                                    completed_pages_ref[0] += 1
                                 break
                         
                         page_listings = parse_page_listings(render_data, worker_id, page_num, log_func)
@@ -289,31 +280,45 @@ async def process_page_from_queue(
                         parse_time = (datetime.now() - parse_start).total_seconds()
                         log_func("debug", f"    ✅ Воркер {worker_id}, страница {page_num}: Парсинг завершен за {parse_time:.2f}с, найдено {len(page_matching_listings)} подходящих из {len(page_listings)} лотов")
                         
-                        # Сохраняем результаты
+                        # Сохраняем результаты в Redis (без блокировки - быстрее!)
                         save_start = datetime.now()
                         task_stages[page_num] = "сохранение_результатов"
                         try:
-                            async def save_results():
-                                async with lock:
-                                    page_idx = page_num - 1
-                                    if 0 <= page_idx < len(results):
-                                        results[page_idx] = page_matching_listings
-                                    completed_pages_ref[0] += 1
-                                    total_time = (datetime.now() - task_start_time).total_seconds()
-                                    log_func("info", f"    ✅ Воркер {worker_id}, страница {page_num}/{total_pages} завершена: Найдено {len(page_listings)} лотов, подходящих {len(page_matching_listings)} (завершено страниц: {completed_pages_ref[0]}/{len(results)}, время: {total_time:.2f}с)")
+                            from .parallel_listing_redis_storage import save_page_results_to_redis
                             
-                            await asyncio.wait_for(save_results(), timeout=30.0)
+                            # Сохраняем в Redis (быстро, без блокировки)
+                            saved = await asyncio.wait_for(
+                                save_page_results_to_redis(
+                                    redis_service=redis_service_for_notifications,
+                                    task_id=task.id if task else 0,
+                                    page_num=page_num,
+                                    page_results=page_matching_listings,
+                                    log_func=log_func
+                                ),
+                                timeout=5.0  # Таймаут 5 секунд для Redis (должно быть быстро)
+                            )
+                            
+                            if saved:
+                                # Обновляем счетчик завершенных страниц в Redis (атомарная операция, без блокировки)
+                                if task and redis_service_for_notifications and redis_service_for_notifications._client:
+                                    try:
+                                        completed_key = f"parsing:completed:task_{task.id}"
+                                        await redis_service_for_notifications._client.incr(completed_key)
+                                    except Exception:
+                                        pass
+                                
+                                total_time = (datetime.now() - task_start_time).total_seconds()
+                                log_func("info", f"    ✅ Воркер {worker_id}, страница {page_num}/{total_pages} завершена: Найдено {len(page_listings)} лотов, подходящих {len(page_matching_listings)} (время: {total_time:.2f}с)")
+                            else:
+                                log_func("warning", f"    ⚠️ Воркер {worker_id}, страница {page_num}: Не удалось сохранить результаты в Redis")
                         except asyncio.TimeoutError:
-                            log_func("error", f"    ⏱️ Воркер {worker_id}, страница {page_num}: Таймаут при сохранении результатов (30с), пропускаем эту страницу")
-                            try:
-                                async with lock:
-                                    completed_pages_ref[0] += 1
-                            except Exception:
-                                pass
-                            continue
+                            log_func("error", f"    ⏱️ Воркер {worker_id}, страница {page_num}: Таймаут при сохранении результатов в Redis (5с)")
+                        except Exception as save_error:
+                            error_msg = str(save_error)[:200]
+                            log_func("error", f"    ❌ Воркер {worker_id}, страница {page_num}: Ошибка при сохранении результатов в Redis: {type(save_error).__name__}: {error_msg}")
                         
                         save_time = (datetime.now() - save_start).total_seconds()
-                        log_func("debug", f"    ✅ Воркер {worker_id}, страница {page_num}: Результаты сохранены за {save_time:.2f}с")
+                        log_func("debug", f"    ✅ Воркер {worker_id}, страница {page_num}: Результаты сохранены в Redis за {save_time:.2f}с")
                         
                         # Отмечаем прокси как успешно использованный
                         if parser.proxy_manager and page_proxy:
@@ -342,7 +347,7 @@ async def process_page_from_queue(
                                 pass
                         timeout_time = (datetime.now() - task_start_time).total_seconds()
                         current_stage = task_stages.get(page_num, "неизвестно")
-                        log_func("error", f"    ⏱️ Воркер {worker_id}, страница {page_num}: ТАЙМАУТ запроса (60с) на этапе '{current_stage}' после {timeout_time:.2f}с работы (попытка {attempt + 1}/{max_retries})")
+                        log_func("error", f"    ⏱️ Воркер {worker_id}, страница {page_num}: ТАЙМАУТ запроса (120с) на этапе '{current_stage}' после {timeout_time:.2f}с работы (попытка {attempt + 1}/{max_retries})")
                         
                         if attempt < max_retries - 1:
                             log_func("warning", f"    ⚠️ Воркер {worker_id}, страница {page_num}: Таймаут запроса, повторяем с другим прокси...")
@@ -354,8 +359,6 @@ async def process_page_from_queue(
                             log_func("error", f"    ❌ Воркер {worker_id}, страница {page_num}: Таймаут запроса после {max_retries} попыток")
                             if page_proxy and parser.proxy_manager:
                                 await parser.proxy_manager.mark_proxy_used(page_proxy, success=False, error="Timeout")
-                            async with lock:
-                                completed_pages_ref[0] += 1
                             if page_num in task_start_times:
                                 del task_start_times[page_num]
                             if page_num in task_stages:
@@ -387,8 +390,6 @@ async def process_page_from_queue(
                             if page_proxy and parser.proxy_manager:
                                 is_429 = "429" in error_msg or "Too Many Requests" in error_msg
                                 await parser.proxy_manager.mark_proxy_used(page_proxy, success=False, error=error_msg, is_429_error=is_429)
-                            async with lock:
-                                completed_pages_ref[0] += 1
                             if page_num in task_start_times:
                                 del task_start_times[page_num]
                             if page_num in task_stages:
@@ -426,8 +427,6 @@ async def process_page_from_queue(
                     except asyncio.CancelledError:
                         pass
                 if page_num:
-                    async with lock:
-                        completed_pages_ref[0] += 1
                     if page_num in task_start_times:
                         del task_start_times[page_num]
                     if page_num in task_stages:

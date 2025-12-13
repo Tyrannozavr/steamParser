@@ -224,6 +224,47 @@ class RedisService:
             logger.error(f"❌ RedisService.delete: Ошибка при удалении ключа '{key}': {e}")
             return False
     
+    async def lrange(self, key: str, start: int, end: int) -> List[str]:
+        """
+        Получает элементы из списка Redis.
+        
+        Args:
+            key: Ключ списка
+            start: Начальный индекс
+            end: Конечный индекс (-1 для всех элементов)
+            
+        Returns:
+            Список значений
+        """
+        if self._client is None:
+            await self.connect()
+        
+        try:
+            return await self._client.lrange(key, start, end)
+        except Exception as e:
+            logger.error(f"❌ RedisService.lrange: Ошибка при получении элементов списка '{key}': {e}")
+            return []
+    
+    async def expire(self, key: str, seconds: int) -> bool:
+        """
+        Устанавливает TTL (время жизни) для ключа.
+        
+        Args:
+            key: Ключ
+            seconds: Время жизни в секундах
+            
+        Returns:
+            True если успешно, False иначе
+        """
+        if self._client is None:
+            await self.connect()
+        
+        try:
+            return await self._client.expire(key, seconds)
+        except Exception as e:
+            logger.error(f"❌ RedisService.expire: Ошибка при установке TTL для ключа '{key}': {e}")
+            return False
+    
     async def push_to_queue(self, queue_name: str, data: Dict[str, Any]):
         """
         Добавляет сообщение в очередь (Redis Streams для лучшей масштабируемости).

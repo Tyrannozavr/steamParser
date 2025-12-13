@@ -113,7 +113,12 @@ class MonitoringService:
         
         # ВАЖНО: Добавляем задачу в очередь RabbitMQ сразу, даже если сервис не запущен
         # Это позволяет воркерам начать обработку немедленно
-        if not self.rabbitmq_service or not self.rabbitmq_service.is_connected():
+        if not self.rabbitmq_service:
+            logger.error(f"❌ Задача {task.id}: RabbitMQ сервис не инициализирован, задача не может быть добавлена в очередь")
+            raise RuntimeError("RabbitMQ должен быть доступен для добавления задач")
+        
+        # Пытаемся переподключиться, если соединение потеряно
+        if not await self.rabbitmq_service.ensure_connected():
             logger.error(f"❌ Задача {task.id}: RabbitMQ недоступен, задача не может быть добавлена в очередь")
             raise RuntimeError("RabbitMQ должен быть доступен для добавления задач")
         
@@ -434,7 +439,14 @@ class MonitoringService:
                         # Публикуем задачу в RabbitMQ для Parsing Worker
                         # ВАЖНО: Redis используется только для флагов выполнения (parsing_task_running),
                         # а задачи публикуются в RabbitMQ
-                        if not self.rabbitmq_service or not self.rabbitmq_service.is_connected():
+                        if not self.rabbitmq_service:
+                            logger.error(f"❌ Задача {task_id}: RabbitMQ сервис не инициализирован, пропускаем эту проверку")
+                            await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                            await asyncio.sleep(task.check_interval)
+                            continue
+                        
+                        # Пытаемся переподключиться, если соединение потеряно
+                        if not await self.rabbitmq_service.ensure_connected():
                             logger.error(f"❌ Задача {task_id}: RabbitMQ недоступен, пропускаем эту проверку")
                             await self._update_next_check_safe(task_id, task_session, task.check_interval)
                             await asyncio.sleep(task.check_interval)
@@ -567,11 +579,19 @@ class MonitoringService:
                                     }
                                     
                                     # Публикуем задачу в RabbitMQ
-                                    if not self.rabbitmq_service or not self.rabbitmq_service.is_connected():
+                                    if not self.rabbitmq_service:
+                                        logger.error(f"❌ Задача {task_id}: RabbitMQ сервис не инициализирован, задача не может быть добавлена в очередь")
+                                        await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                                        await asyncio.sleep(task.check_interval)
+                                        continue
+                                    
+                                    # Пытаемся переподключиться, если соединение потеряно
+                                    if not await self.rabbitmq_service.ensure_connected():
                                         logger.error(f"❌ Задача {task_id}: RabbitMQ недоступен, задача не может быть добавлена в очередь")
                                         # Пропускаем эту итерацию, попробуем в следующий раз
                                         await self._update_next_check_safe(task_id, task_session, task.check_interval)
                                         await asyncio.sleep(task.check_interval)
+                                        continue
                                         continue
                                     
                                     logger.info(f"📤 Задача {task_id}: Добавляем задачу в RabbitMQ очередь 'parsing_tasks'")

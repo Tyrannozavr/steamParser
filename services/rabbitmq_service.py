@@ -133,6 +133,13 @@ class RabbitMQService:
         except Exception as e:
             logger.error(f"❌ Ошибка подключения к RabbitMQ: {e}")
             self._is_connected = False
+            # Сбрасываем соединение при ошибке
+            if self._connection:
+                try:
+                    await self._connection.close()
+                except Exception:
+                    pass
+                self._connection = None
             raise
     
     async def disconnect(self):
@@ -158,7 +165,32 @@ class RabbitMQService:
     
     def is_connected(self) -> bool:
         """Проверяет, подключен ли клиент к RabbitMQ."""
-        return self._is_connected and self._connection is not None and not self._connection.is_closed
+        if not self._is_connected:
+            return False
+        if self._connection is None:
+            return False
+        if self._connection.is_closed:
+            self._is_connected = False
+            return False
+        return True
+    
+    async def ensure_connected(self) -> bool:
+        """
+        Убеждается, что соединение активно, пытается переподключиться при необходимости.
+        
+        Returns:
+            True если соединение активно, False если не удалось подключиться
+        """
+        if self.is_connected():
+            return True
+        
+        # Пытаемся переподключиться
+        try:
+            await self.connect()
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось переподключиться к RabbitMQ: {e}")
+            return False
     
     async def publish_task(self, task_data: Dict[str, Any], priority: int = 0, delay_seconds: int = 0):
         """
