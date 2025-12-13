@@ -17,6 +17,7 @@ from core.database import DatabaseManager
 from services.proxy_manager import ProxyManager
 from services.parsing_service import ParsingService
 from services.redis_service import RedisService
+from services.rabbitmq_service import RabbitMQService
 from typing import Optional, Callable, TYPE_CHECKING
 
 
@@ -30,6 +31,7 @@ class MonitoringService:
         notification_callback: Optional[Callable] = None,
         parsing_service: Optional[ParsingService] = None,
         redis_service: Optional[RedisService] = None,
+        rabbitmq_service: Optional[RabbitMQService] = None,
         db_manager: Optional[DatabaseManager] = None
     ):
         """
@@ -48,6 +50,7 @@ class MonitoringService:
         self.proxy_manager = proxy_manager
         self.notification_callback = notification_callback
         self.redis_service = redis_service
+        self.rabbitmq_service = rabbitmq_service
         self._running = False
         self._tasks: Dict[int, asyncio.Task] = {}
         self._task_sessions: Dict[int, AsyncSession] = {}  # Отдельные сессии для каждой задачи
@@ -108,23 +111,27 @@ class MonitoringService:
             except Exception as e:
                 logger.warning(f"⚠️ Задача {task.id}: Ошибка при проверке/очистке флага: {e}")
         
-        # ВАЖНО: Добавляем задачу в очередь Redis сразу, даже если сервис не запущен
+        # ВАЖНО: Добавляем задачу в очередь RabbitMQ сразу, даже если сервис не запущен
         # Это позволяет воркерам начать обработку немедленно
-        if self.redis_service and self.redis_service.is_connected():
-            try:
-                task_data = {
-                    "type": "parsing_task",
-                    "task_id": task.id,
-                    "filters_json": task.filters_json,  # Уже dict (JSONB)
-                    "item_name": task.item_name,
-                    "appid": task.appid,
-                    "currency": task.currency
-                }
-                await self.redis_service.push_to_queue("parsing_tasks", task_data)
-                logger.info(f"📤 Задача {task.id}: Немедленно добавлена в очередь Redis для обработки воркером")
-                logger.info(f"   📋 Данные задачи: item_name='{task.item_name}', appid={task.appid}, currency={task.currency}")
-            except Exception as e:
-                logger.warning(f"⚠️ Задача {task.id}: Не удалось добавить в очередь Redis: {e}")
+        if not self.rabbitmq_service or not self.rabbitmq_service.is_connected():
+            logger.error(f"❌ Задача {task.id}: RabbitMQ недоступен, задача не может быть добавлена в очередь")
+            raise RuntimeError("RabbitMQ должен быть доступен для добавления задач")
+        
+        try:
+            task_data = {
+                "type": "parsing_task",
+                "task_id": task.id,
+                "filters_json": task.filters_json,  # Уже dict (JSONB)
+                "item_name": task.item_name,
+                "appid": task.appid,
+                "currency": task.currency
+            }
+            await self.rabbitmq_service.publish_task(task_data)
+            logger.info(f"📤 Задача {task.id}: Немедленно добавлена в очередь RabbitMQ для обработки воркером")
+            logger.info(f"   📋 Данные задачи: item_name='{task.item_name}', appid={task.appid}, currency={task.currency}")
+        except Exception as e:
+            logger.error(f"❌ Задача {task.id}: Не удалось добавить в очередь RabbitMQ: {e}")
+            raise
         
         # Если сервис запущен, начинаем мониторинг (для периодических проверок)
         if self._running:
@@ -400,46 +407,53 @@ class MonitoringService:
                             await asyncio.sleep(min(task.check_interval, 60))
                             continue
                         
-                        # Если Redis доступен, публикуем задачу в Redis для Parsing Worker
-                        if self.redis_service and self.redis_service.is_connected():
+                        # Публикуем задачу в RabbitMQ для Parsing Worker
+                        # ВАЖНО: Redis используется только для флагов выполнения (parsing_task_running),
+                        # а задачи публикуются в RabbitMQ
+                        if not self.rabbitmq_service or not self.rabbitmq_service.is_connected():
+                            logger.error(f"❌ Задача {task_id}: RabbitMQ недоступен, пропускаем эту проверку")
+                            await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                            await asyncio.sleep(task.check_interval)
+                            continue
+                        
+                        try:
+                            # ВАЖНО: Проверяем, не выполняется ли уже парсинг для этой задачи (через Redis флаги)
+                            task_running_key = f"parsing_task_running:{task_id}"
+                            is_running = None
+                            task_start_time = None
                             try:
-                                # ВАЖНО: Проверяем, не выполняется ли уже парсинг для этой задачи
-                                task_running_key = f"parsing_task_running:{task_id}"
-                                is_running = None
-                                task_start_time = None
-                                try:
-                                    if self.redis_service._client:
-                                        flag_value = await self.redis_service._client.get(task_running_key)
-                                        # Проверяем TTL флага - если TTL=-2, флаг не существует или некорректен
-                                        if flag_value:
-                                            ttl_check = await self.redis_service._client.ttl(task_running_key)
-                                            # Если TTL=-2, флаг некорректен - удаляем его сразу
-                                            if ttl_check == -2:
-                                                logger.warning(f"⚠️ Задача {task_id}: Флаг существует, но TTL=-2 (некорректно). Удаляем флаг.")
-                                                await self.redis_service._client.delete(task_running_key)
-                                                is_running = False
-                                                flag_value = None  # Сбрасываем flag_value, чтобы не обрабатывать его дальше
-                                                logger.info(f"✅ Задача {task_id}: Флаг удален, is_running=False, задача будет опубликована")
-                                            else:
-                                                # Флаг считается существующим только если TTL > 0 или TTL = -1 (без TTL)
-                                                is_running = ttl_check > 0 or ttl_check == -1
-                                        else:
+                                if self.redis_service and self.redis_service.is_connected() and self.redis_service._client:
+                                    flag_value = await self.redis_service._client.get(task_running_key)
+                                    # Проверяем TTL флага - если TTL=-2, флаг не существует или некорректен
+                                    if flag_value:
+                                        ttl_check = await self.redis_service._client.ttl(task_running_key)
+                                        # Если TTL=-2, флаг некорректен - удаляем его сразу
+                                        if ttl_check == -2:
+                                            logger.warning(f"⚠️ Задача {task_id}: Флаг существует, но TTL=-2 (некорректно). Удаляем флаг.")
+                                            await self.redis_service._client.delete(task_running_key)
                                             is_running = False
-                                        
-                                        # Пытаемся извлечь время начала выполнения из значения флага
-                                        if flag_value and is_running:
-                                            try:
-                                                # Значение флага содержит ISO timestamp времени начала выполнения
-                                                task_start_time = datetime.fromisoformat(flag_value.decode('utf-8') if isinstance(flag_value, bytes) else flag_value)
-                                            except (ValueError, AttributeError):
-                                                # Если не удалось распарсить timestamp, используем TTL для оценки
-                                                ttl = await self.redis_service._client.ttl(task_running_key)
-                                                if ttl > 0:
-                                                    # Флаг устанавливается с TTL=3600 (60 минут)
-                                                    elapsed_seconds = 3600 - ttl
-                                                    task_start_time = now - timedelta(seconds=elapsed_seconds)
-                                except Exception as e:
-                                    logger.debug(f"⚠️ Задача {task_id}: Ошибка при проверке флага выполнения: {e}")
+                                            flag_value = None  # Сбрасываем flag_value, чтобы не обрабатывать его дальше
+                                            logger.info(f"✅ Задача {task_id}: Флаг удален, is_running=False, задача будет опубликована")
+                                        else:
+                                            # Флаг считается существующим только если TTL > 0 или TTL = -1 (без TTL)
+                                            is_running = ttl_check > 0 or ttl_check == -1
+                                    else:
+                                        is_running = False
+                                    
+                                    # Пытаемся извлечь время начала выполнения из значения флага
+                                    if flag_value and is_running:
+                                        try:
+                                            # Значение флага содержит ISO timestamp времени начала выполнения
+                                            task_start_time = datetime.fromisoformat(flag_value.decode('utf-8') if isinstance(flag_value, bytes) else flag_value)
+                                        except (ValueError, AttributeError):
+                                            # Если не удалось распарсить timestamp, используем TTL для оценки
+                                            ttl = await self.redis_service._client.ttl(task_running_key)
+                                            if ttl > 0:
+                                                # Флаг устанавливается с TTL=3600 (60 минут)
+                                                elapsed_seconds = 3600 - ttl
+                                                task_start_time = now - timedelta(seconds=elapsed_seconds)
+                            except Exception as e:
+                                logger.debug(f"⚠️ Задача {task_id}: Ошибка при проверке флага выполнения: {e}")
                                 
                                 if is_running:
                                     # Проверяем, не зависла ли задача (выполняется слишком долго)
@@ -527,33 +541,35 @@ class MonitoringService:
                                         "appid": task.appid,
                                         "currency": task.currency
                                     }
-                                    logger.info(f"📤 Задача {task_id}: Добавляем задачу в Redis очередь 'parsing_tasks' (push_to_queue)")
+                                    
+                                    # Публикуем задачу в RabbitMQ
+                                    if not self.rabbitmq_service or not self.rabbitmq_service.is_connected():
+                                        logger.error(f"❌ Задача {task_id}: RabbitMQ недоступен, задача не может быть добавлена в очередь")
+                                        # Пропускаем эту итерацию, попробуем в следующий раз
+                                        await self._update_next_check_safe(task_id, task_session, task.check_interval)
+                                        await asyncio.sleep(task.check_interval)
+                                        continue
+                                    
+                                    logger.info(f"📤 Задача {task_id}: Добавляем задачу в RabbitMQ очередь 'parsing_tasks'")
                                     logger.debug(f"   Данные задачи: task_id={task_id}, item_name={task.item_name}, appid={task.appid}")
-                                    # Используем очередь вместо pub/sub - задача будет удалена после обработки
-                                    await self.redis_service.push_to_queue("parsing_tasks", task_data)
-                                    logger.info(f"✅ Задача {task_id}: Успешно добавлена в очередь Redis")
+                                    await self.rabbitmq_service.publish_task(task_data)
+                                    logger.info(f"✅ Задача {task_id}: Успешно добавлена в очередь RabbitMQ")
+                                    
                                     # ВАЖНО: НЕ обновляем next_check сразу - пусть обновится только после завершения обработки
                                     # или при следующей проверке (если парсинг еще выполняется)
                                     # Это предотвращает планирование новой проверки, пока текущая еще не завершена
                                     logger.debug(f"⏳ Задача {task_id}: Задача добавлена в очередь, next_check будет обновлен после завершения обработки")
-                            except Exception as e:
-                                logger.error(f"❌ Задача {task_id}: Ошибка публикации в Redis: {e}")
-                                import traceback
-                                logger.debug(f"Traceback: {traceback.format_exc()}")
-                                # Fallback: выполняем проверку напрямую
-                                logger.info(f"🔄 Задача {task_id}: Выполняем проверку напрямую (fallback)")
-                                await self._check_task(task, task_session)
-                                # При fallback обновляем next_check после завершения проверки
-                                await self._update_next_check_safe(task_id, task_session, task.check_interval)
-                        else:
+                        except Exception as e:
+                            logger.error(f"❌ Задача {task_id}: Ошибка публикации в RabbitMQ: {e}")
+                            import traceback
+                            logger.debug(f"Traceback: {traceback.format_exc()}")
                             # Fallback: выполняем проверку напрямую
-                            redis_status = "не инициализирован" if not self.redis_service else "не подключен"
-                            logger.warning(f"⚠️ Задача {task_id}: Redis {redis_status}, выполняем проверку напрямую")
+                            logger.info(f"🔄 Задача {task_id}: Выполняем проверку напрямую (fallback)")
                             await self._check_task(task, task_session)
                             # При fallback обновляем next_check после завершения проверки
                             await self._update_next_check_safe(task_id, task_session, task.check_interval)
-                    
-                        # Ждем до следующей проверки
+                        
+                        # Ждем до следующей проверки (внутри основного try, вне вложенного try-except)
                         logger.debug(f"💤 Задача {task_id}: Ожидание {task.check_interval} сек до следующей проверки")
                         await asyncio.sleep(task.check_interval)
                     
@@ -842,7 +858,7 @@ class MonitoringService:
                                 })
                                 logger.debug(f"📤 Опубликовано уведомление в Redis для предмета {found_item.id}")
                             except Exception as e:
-                                logger.error(f"Ошибка публикации в Redis: {e}")
+                                logger.error(f"Ошибка публикации в RabbitMQ: {e}")
                                 # Fallback на прямой callback
                                 if self.notification_callback:
                                     try:

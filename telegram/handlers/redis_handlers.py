@@ -84,18 +84,44 @@ class RedisHandlers:
                         task_logger.info(f"✅ Данные загружены: предмет={found_item.item_name}, задача={task.name}")
 
 
+                        # ВАЖНО: Обновляем объект из БД перед проверкой (защита от race condition)
+                        await session.refresh(found_item)
+                        
                         # ВАЖНО: Проверяем, не было ли уже отправлено уведомление (защита от дублей)
-
                         if found_item.notification_sent:
-
                             logger.warning(f"⚠️ TelegramBot: Уведомление для предмета {found_item.id} уже было отправлено, пропускаем (защита от дублей)")
-
                             task_logger.warning(f"⚠️ Уведомление для предмета {found_item.id} уже было отправлено, пропускаем")
-
                             return
-
-
-                        # Отправляем уведомление СРАЗУ (до коммита в БД)
+                        
+                        # ВАЖНО: Устанавливаем флаг ДО отправки (защита от дублей при параллельной обработке)
+                        # Используем атомарную операцию UPDATE для предотвращения race condition
+                        from sqlalchemy import update
+                        from datetime import datetime
+                        update_result = await session.execute(
+                            update(FoundItem)
+                            .where(
+                                (FoundItem.id == found_item.id) &
+                                (FoundItem.notification_sent == False)
+                            )
+                            .values(
+                                notification_sent=True,
+                                notification_sent_at=datetime.now()
+                            )
+                        )
+                        
+                        if update_result.rowcount == 0:
+                            # Флаг уже был установлен другим процессом - пропускаем
+                            logger.warning(f"⚠️ TelegramBot: Уведомление для предмета {found_item.id} уже обрабатывается другим процессом, пропускаем")
+                            task_logger.warning(f"⚠️ Уведомление уже обрабатывается другим процессом, пропускаем")
+                            return
+                        
+                        await session.commit()
+                        logger.debug(f"✅ TelegramBot: Флаг notification_sent установлен для предмета {found_item.id}")
+                        
+                        # Обновляем объект в памяти
+                        await session.refresh(found_item)
+                        
+                        # Отправляем уведомление
 
                         logger.info(f"📤 TelegramBot: Отправляем уведомление в Telegram (chat_id={self.bot.chat_id})")
 
@@ -104,30 +130,25 @@ class RedisHandlers:
                         try:
 
                             await self.bot.notification_handlers.send_notification(found_item, task)
-
-
-                            # Только после успешной отправки отмечаем как отправленное
-
-                            found_item.notification_sent = True
-
-                            found_item.notification_sent_at = datetime.now()
-
-                            await session.commit()
-
-                            logger.info(f"✅ TelegramBot: Уведомление отправлено и отмечено в БД для предмета {found_item.id}")
-
-                            task_logger.success(f"✅ Уведомление отправлено и отмечено в БД для предмета {found_item.id}")
+                            # Флаг уже установлен выше через атомарный UPDATE
+                            logger.info(f"✅ TelegramBot: Уведомление для предмета {found_item.id} успешно отправлено")
+                            task_logger.success(f"✅ Уведомление для предмета {found_item.id} успешно отправлено")
 
                         except Exception as e:
-
                             logger.error(f"❌ TelegramBot: Не удалось отправить уведомление для предмета {found_item.id}: {e}")
-
                             task_logger.exception(f"❌ Не удалось отправить уведомление для предмета {found_item.id}: {e}")
-
-                            # НЕ помечаем как отправленное, чтобы можно было повторить попытку
-
-                            await session.rollback()
-
+                            # Откатываем флаг notification_sent, чтобы можно было повторить попытку
+                            try:
+                                from sqlalchemy import update
+                                await session.execute(
+                                    update(FoundItem)
+                                    .where(FoundItem.id == found_item.id)
+                                    .values(notification_sent=False, notification_sent_at=None)
+                                )
+                                await session.commit()
+                                logger.info(f"🔄 TelegramBot: Флаг notification_sent сброшен для предмета {found_item.id} (для повторной попытки)")
+                            except Exception as rollback_error:
+                                logger.warning(f"⚠️ TelegramBot: Не удалось сбросить флаг notification_sent: {rollback_error}")
                             raise
 
                     else:

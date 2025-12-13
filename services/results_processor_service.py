@@ -91,7 +91,9 @@ class ResultsProcessorService:
             logger.info(f"💾 Проверяем сохранение предмета: {item_name} (${price:.2f}), listing_id={listing_id}")
             
             # Проверяем дубликаты по listing_id
+            # ВАЖНО: Всегда приводим listing_id к строке для корректного сравнения
             if listing_id:
+                listing_id_str = str(listing_id)
                 all_task_items = await self.db_session.execute(
                     select(FoundItem).where(FoundItem.task_id == task.id)
                 )
@@ -100,8 +102,9 @@ class ResultsProcessorService:
                     try:
                         existing_data = json.loads(existing_item.item_data_json)
                         existing_listing_id = existing_data.get('listing_id')
-                        if existing_listing_id and existing_listing_id == listing_id:
-                            logger.info(f"   ⏭️ Предмет с listing_id={listing_id} уже существует в БД (ID={existing_item.id}), пропускаем")
+                        # ВАЖНО: Приводим к строке для корректного сравнения
+                        if existing_listing_id and str(existing_listing_id) == listing_id_str:
+                            logger.info(f"   ⏭️ Предмет с listing_id={listing_id_str} уже существует в БД (ID={existing_item.id}), пропускаем")
                             found_duplicate = True
                             break
                     except (json.JSONDecodeError, AttributeError):
@@ -255,6 +258,12 @@ class ResultsProcessorService:
         
         logger.info(f"📤 ResultsProcessor: Публикуем {len(found_items)} уведомлений в Redis канал 'found_items'")
         for found_item in found_items:
+            # ВАЖНО: Проверяем еще раз, что уведомление не было отправлено (защита от race condition)
+            await self.db_session.refresh(found_item)
+            if found_item.notification_sent:
+                logger.warning(f"⚠️ ResultsProcessor: Уведомление для предмета {found_item.id} уже было отправлено, пропускаем (защита от дублей)")
+                continue
+            
             notification_data = {
                 "type": "found_item",
                 "item_id": found_item.id,
@@ -266,6 +275,22 @@ class ResultsProcessorService:
                 "task_name": task.name
             }
             logger.info(f"📤 ResultsProcessor: Публикуем уведомление для предмета {found_item.id} ({found_item.item_name}, ${found_item.price:.2f})")
+            
+            # ВАЖНО: Обновляем флаг notification_sent СРАЗУ после публикации (до отправки в Telegram)
+            # Это предотвращает дублирование уведомлений при повторной обработке сообщения из Redis
+            try:
+                found_item.notification_sent = True
+                found_item.notification_sent_at = datetime.now()
+                await self.db_session.commit()
+                logger.debug(f"✅ ResultsProcessor: Флаг notification_sent установлен для предмета {found_item.id}")
+            except Exception as commit_error:
+                logger.warning(f"⚠️ ResultsProcessor: Не удалось обновить notification_sent для предмета {found_item.id}: {commit_error}")
+                try:
+                    await self.db_session.rollback()
+                except Exception:
+                    pass
+            
+            # Публикуем уведомление в Redis
             await self.redis_service.publish("found_items", notification_data)
             logger.info(f"✅ ResultsProcessor: Уведомление для предмета {found_item.id} опубликовано")
     

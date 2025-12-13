@@ -58,6 +58,10 @@ class Config:
     # Parsing Worker
     ENABLE_MONITORING_SERVICE: bool = os.getenv("ENABLE_MONITORING_SERVICE", "true").lower() == "true"
     
+    # RabbitMQ
+    RABBITMQ_URL: str = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+    RABBITMQ_ENABLED: bool = os.getenv("RABBITMQ_ENABLED", "true").lower() == "true"
+    
     @classmethod
     def validate(cls) -> bool:
         """

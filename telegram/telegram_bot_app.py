@@ -13,6 +13,7 @@ from core import Config, DatabaseManager
 from core.logger import setup_logging
 from services import ProxyManager
 from services.redis_service import RedisService
+from services.rabbitmq_service import RabbitMQService
 from telegram import TelegramBotManager
 
 # Импорт версии
@@ -46,6 +47,7 @@ class TelegramBotApplication:
         self.proxy_manager: Optional[ProxyManager] = None
         self.telegram_bot: Optional[TelegramBotManager] = None
         self.redis_service: Optional[RedisService] = None
+        self.rabbitmq_service: Optional[RabbitMQService] = None
         self._shutdown_event = asyncio.Event()
         
         # Обработка сигналов
@@ -122,6 +124,19 @@ class TelegramBotApplication:
             logger.error(f"❌ Не удалось подключиться к Redis: {e}")
             raise
         
+        # Инициализируем RabbitMQ (если включен)
+        if Config.RABBITMQ_ENABLED:
+            try:
+                self.rabbitmq_service = RabbitMQService(rabbitmq_url=Config.RABBITMQ_URL)
+                await self.rabbitmq_service.connect()
+                logger.info(f"✅ RabbitMQ подключен: {Config.RABBITMQ_URL}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось подключиться к RabbitMQ: {e}. Продолжаем без RabbitMQ.")
+                self.rabbitmq_service = None
+        else:
+            logger.info("ℹ️ RabbitMQ отключен в конфигурации")
+            self.rabbitmq_service = None
+        
         # Инициализируем менеджер прокси через фабрику с Redis для кэширования (после инициализации Redis)
         from services.proxy_manager_factory import ProxyManagerFactory
         self.proxy_manager = await ProxyManagerFactory.get_instance(
@@ -138,7 +153,9 @@ class TelegramBotApplication:
             self.db_session,
             self.proxy_manager,
             notification_callback=None,  # Уведомления через Redis
-            redis_service=self.redis_service
+            redis_service=self.redis_service,
+            rabbitmq_service=self.rabbitmq_service,
+            db_manager=self.db_manager
         )
         
         self.telegram_bot = TelegramBotManager(
@@ -168,6 +185,12 @@ class TelegramBotApplication:
                 await self.redis_service.disconnect()
             except Exception as e:
                 logger.warning(f"Ошибка при остановке Redis: {e}")
+        
+        if self.rabbitmq_service:
+            try:
+                await self.rabbitmq_service.disconnect()
+            except Exception as e:
+                logger.warning(f"Ошибка при остановке RabbitMQ: {e}")
         
         if self.db_session:
             await self.db_session.close()

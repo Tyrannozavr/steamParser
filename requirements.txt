@@ -26,6 +26,9 @@ python-dotenv>=1.0.0
 redis>=5.0.0
 hiredis>=2.2.0
 
+# RabbitMQ для надежной обработки задач
+aio-pika>=9.0.0
+
 # FastAPI для Parser API сервиса
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0

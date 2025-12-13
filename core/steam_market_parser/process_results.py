@@ -3,6 +3,7 @@
 Отвечает за фильтрацию, запрос цен наклеек (если нужно) и отправку уведомлений в телеграм.
 Обрабатывает результаты сразу после парсинга страницы, не накапливая их.
 """
+import asyncio
 import json
 from typing import Optional, Dict, Any
 from sqlalchemy import select
@@ -30,11 +31,17 @@ async def process_item_result(
     # Это предотвращает ошибку "Instance is not persistent within this Session"
     if task and hasattr(task, 'id'):
         try:
-            # Пытаемся загрузить task в текущей сессии
-            task = await db_session.get(MonitoringTask, task.id)
+            # Пытаемся загрузить task в текущей сессии с таймаутом
+            task = await asyncio.wait_for(
+                db_session.get(MonitoringTask, task.id),
+                timeout=10.0  # Таймаут 10 секунд для загрузки задачи
+            )
             if not task:
                 logger.error(f"❌ Задача {task.id if hasattr(task, 'id') else 'unknown'} не найдена в БД")
                 return False
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ Таймаут при загрузке задачи из БД (10с), БД может быть недоступна")
+            return False
         except Exception as e:
             logger.warning(f"⚠️ Не удалось загрузить task в текущей сессии: {e}, используем переданный объект")
     """
@@ -397,57 +404,101 @@ async def process_item_result(
                         if task_logger:
                             task_logger.info(f"✅ Получены цены наклеек для публикации: ${total_stickers_price:.2f}")
         
-        # Проверяем дубликаты по listing_id (приоритетная проверка)
+        # Проверяем дубликаты по listing_id (приоритетная проверка) с таймаутом
         if listing_id:
-            all_task_items = await db_session.execute(
-                select(FoundItem).where(FoundItem.task_id == task.id)
-            )
-            for existing_item in all_task_items.scalars().all():
-                try:
-                    existing_data = json.loads(existing_item.item_data_json)
-                    existing_listing_id = existing_data.get('listing_id')
-                    if existing_listing_id and str(existing_listing_id) == str(listing_id):
-                        logger.info(f"⏭️ Предмет с listing_id={listing_id} уже существует в БД (ID={existing_item.id}), пропускаем")
-                        if task_logger:
-                            task_logger.info(f"⏭️ Предмет уже существует в БД, пропускаем")
-                        return False
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+            try:
+                all_task_items = await asyncio.wait_for(
+                    db_session.execute(
+                        select(FoundItem).where(FoundItem.task_id == task.id)
+                    ),
+                    timeout=10.0  # Таймаут 10 секунд для запроса к БД
+                )
+                for existing_item in all_task_items.scalars().all():
+                    try:
+                        existing_data = json.loads(existing_item.item_data_json)
+                        existing_listing_id = existing_data.get('listing_id')
+                        if existing_listing_id and str(existing_listing_id) == str(listing_id):
+                            logger.info(f"⏭️ Предмет с listing_id={listing_id} уже существует в БД (ID={existing_item.id}), пропускаем")
+                            if task_logger:
+                                task_logger.info(f"⏭️ Предмет уже существует в БД, пропускаем")
+                            return False
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+            except asyncio.TimeoutError:
+                logger.error(f"⏱️ Таймаут при проверке дубликатов по listing_id (10с), БД может быть недоступна")
+                if task_logger:
+                    task_logger.error(f"⏱️ Таймаут при проверке дубликатов")
+                return False
+            except Exception as db_error:
+                logger.error(f"❌ Ошибка при проверке дубликатов по listing_id: {type(db_error).__name__}: {db_error}")
+                if task_logger:
+                    task_logger.error(f"❌ Ошибка при проверке дубликатов: {db_error}")
+                return False
         
         # Дополнительная проверка по комбинации task_id + item_name + price + listing_id
         # Для брелков и других предметов с listing_id это более точная проверка
         if listing_id:
             # Если есть listing_id, проверяем по нему (уже проверили выше, но на всякий случай)
-            existing_query = select(FoundItem).where(
-                FoundItem.task_id == task.id,
-                FoundItem.item_name == item_name,
-                FoundItem.price == item_price
-            )
-            existing_items = await db_session.execute(existing_query)
-            for existing_item in existing_items.scalars().all():
-                try:
-                    existing_data = json.loads(existing_item.item_data_json)
-                    existing_listing_id = existing_data.get('listing_id')
-                    # Если у существующего предмета нет listing_id или он отличается - это разные лоты
-                    if existing_listing_id and str(existing_listing_id) == str(listing_id):
-                        logger.info(f"⏭️ Предмет с listing_id={listing_id} уже существует в БД (ID={existing_item.id}), пропускаем")
-                        if task_logger:
-                            task_logger.info(f"⏭️ Предмет уже существует в БД, пропускаем")
-                        return False
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+            try:
+                existing_query = select(FoundItem).where(
+                    FoundItem.task_id == task.id,
+                    FoundItem.item_name == item_name,
+                    FoundItem.price == item_price
+                )
+                existing_items = await asyncio.wait_for(
+                    db_session.execute(existing_query),
+                    timeout=10.0  # Таймаут 10 секунд для запроса к БД
+                )
+                for existing_item in existing_items.scalars().all():
+                    try:
+                        existing_data = json.loads(existing_item.item_data_json)
+                        existing_listing_id = existing_data.get('listing_id')
+                        # ВАЖНО: Приводим к строке для корректного сравнения (защита от дублей)
+                        listing_id_str = str(listing_id) if listing_id else None
+                        # Если у существующего предмета нет listing_id или он отличается - это разные лоты
+                        if existing_listing_id and listing_id_str and str(existing_listing_id) == listing_id_str:
+                            logger.info(f"⏭️ Предмет с listing_id={listing_id} уже существует в БД (ID={existing_item.id}), пропускаем")
+                            if task_logger:
+                                task_logger.info(f"⏭️ Предмет уже существует в БД, пропускаем")
+                            return False
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+            except asyncio.TimeoutError:
+                logger.error(f"⏱️ Таймаут при проверке дубликатов (10с), БД может быть недоступна")
+                if task_logger:
+                    task_logger.error(f"⏱️ Таймаут при проверке дубликатов")
+                return False
+            except Exception as db_error:
+                logger.error(f"❌ Ошибка при проверке дубликатов: {type(db_error).__name__}: {db_error}")
+                if task_logger:
+                    task_logger.error(f"❌ Ошибка при проверке дубликатов: {db_error}")
+                return False
         else:
             # Если нет listing_id, проверяем только по task_id + item_name + price
-            existing_query = select(FoundItem).where(
-                FoundItem.task_id == task.id,
-                FoundItem.item_name == item_name,
-                FoundItem.price == item_price
-            )
-            existing = await db_session.execute(existing_query.limit(1))
-            if existing.scalar_one_or_none():
-                logger.info(f"⏭️ Предмет уже существует в БД, пропускаем: {item_name} (${item_price:.2f})")
+            try:
+                existing_query = select(FoundItem).where(
+                    FoundItem.task_id == task.id,
+                    FoundItem.item_name == item_name,
+                    FoundItem.price == item_price
+                )
+                existing = await asyncio.wait_for(
+                    db_session.execute(existing_query.limit(1)),
+                    timeout=10.0  # Таймаут 10 секунд для запроса к БД
+                )
+                if existing.scalar_one_or_none():
+                    logger.info(f"⏭️ Предмет уже существует в БД, пропускаем: {item_name} (${item_price:.2f})")
+                    if task_logger:
+                        task_logger.info(f"⏭️ Предмет уже существует в БД, пропускаем")
+                    return False
+            except asyncio.TimeoutError:
+                logger.error(f"⏱️ Таймаут при проверке дубликатов (10с), БД может быть недоступна")
                 if task_logger:
-                    task_logger.info(f"⏭️ Предмет уже существует в БД, пропускаем")
+                    task_logger.error(f"⏱️ Таймаут при проверке дубликатов")
+                return False
+            except Exception as db_error:
+                logger.error(f"❌ Ошибка при проверке дубликатов: {type(db_error).__name__}: {db_error}")
+                if task_logger:
+                    task_logger.error(f"❌ Ошибка при проверке дубликатов: {db_error}")
                 return False
         
         # Преобразуем parsed_data в JSON-сериализуемый формат
@@ -469,15 +520,24 @@ async def process_item_result(
         
         try:
             db_session.add(found_item)
-            await db_session.flush()  # Получаем ID предмета
+            await asyncio.wait_for(
+                db_session.flush(),  # Получаем ID предмета
+                timeout=10.0  # Таймаут 10 секунд для flush
+            )
             
             # Обновляем счетчик найденных предметов в задаче
-            await db_session.refresh(task)
+            await asyncio.wait_for(
+                db_session.refresh(task),
+                timeout=10.0  # Таймаут 10 секунд для refresh
+            )
             task.items_found += 1
             task.total_checks += 1
             
             # Сохраняем изменения в БД
-            await db_session.commit()
+            await asyncio.wait_for(
+                db_session.commit(),
+                timeout=10.0  # Таймаут 10 секунд для commit
+            )
             
             logger.info(f"💾 Предмет сохранен в БД: {item_name} (${item_price:.2f}), ID={found_item.id}")
             if task_logger:
@@ -506,13 +566,22 @@ async def process_item_result(
             
             return True
             
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ Таймаут при сохранении предмета {item_name} в БД (10с), БД может быть недоступна или перегружена")
+            if task_logger:
+                task_logger.error(f"⏱️ Таймаут при сохранении")
+            try:
+                await asyncio.wait_for(db_session.rollback(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            return False
         except Exception as save_error:
             logger.error(f"❌ Ошибка при сохранении предмета {item_name} в БД: {save_error}")
             if task_logger:
                 task_logger.error(f"❌ Ошибка при сохранении: {save_error}")
             try:
-                await db_session.rollback()
-            except Exception:
+                await asyncio.wait_for(db_session.rollback(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
                 pass
             return False
             

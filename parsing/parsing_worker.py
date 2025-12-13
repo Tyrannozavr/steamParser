@@ -9,13 +9,14 @@ import signal
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional, Set, Dict, Any
 from loguru import logger
 
 from core import Config, DatabaseManager
 from core.logger import setup_logging, get_task_logger, set_task_id
 from services import MonitoringService, ProxyManager, ParsingService, ResultsProcessorService
 from services.redis_service import RedisService
+from services.rabbitmq_service import RabbitMQService
 
 # Импорт версии
 try:
@@ -40,6 +41,7 @@ class ParsingWorker:
         self.proxy_manager: Optional[ProxyManager] = None
         self.parsing_service: Optional[ParsingService] = None
         self.redis_service: Optional[RedisService] = None
+        self.rabbitmq_service: Optional[RabbitMQService] = None
         self.monitoring_service: Optional[MonitoringService] = None
         self._running = False
         self._shutdown_event = asyncio.Event()
@@ -75,18 +77,31 @@ class ParsingWorker:
         await self.db_manager.init_db()
         self.db_session = await self.db_manager.get_session()
         
-        # Инициализируем Redis (обязательно для воркера)
-        if not Config.REDIS_ENABLED:
-            logger.error("❌ Redis должен быть включен для Parsing Worker!")
-            logger.error("   Установите REDIS_ENABLED=true в .env")
-            raise ValueError("Redis должен быть включен для Parsing Worker")
+        # Инициализируем Redis (для кэширования и других операций)
+        if Config.REDIS_ENABLED:
+            try:
+                self.redis_service = RedisService(redis_url=Config.REDIS_URL)
+                await self.redis_service.connect()
+                logger.info(f"✅ Redis подключен: {Config.REDIS_URL}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось подключиться к Redis: {e}, продолжаем без Redis")
+                self.redis_service = None
+        else:
+            logger.info("ℹ️ Redis отключен в конфигурации")
+            self.redis_service = None
+        
+        # Инициализируем RabbitMQ (обязательно для воркера)
+        if not Config.RABBITMQ_ENABLED:
+            logger.error("❌ RabbitMQ должен быть включен для Parsing Worker!")
+            logger.error("   Установите RABBITMQ_ENABLED=true в .env")
+            raise ValueError("RabbitMQ должен быть включен для Parsing Worker")
         
         try:
-            self.redis_service = RedisService(redis_url=Config.REDIS_URL)
-            await self.redis_service.connect()
-            logger.info(f"✅ Redis подключен: {Config.REDIS_URL}")
+            self.rabbitmq_service = RabbitMQService(rabbitmq_url=Config.RABBITMQ_URL)
+            await self.rabbitmq_service.connect()
+            logger.info(f"✅ RabbitMQ подключен: {Config.RABBITMQ_URL}")
         except Exception as e:
-            logger.error(f"❌ Не удалось подключиться к Redis: {e}")
+            logger.error(f"❌ Не удалось подключиться к RabbitMQ: {e}")
             raise
         
         # Инициализируем менеджер прокси с Redis для кэширования (после инициализации Redis)
@@ -127,7 +142,8 @@ class ParsingWorker:
             self.proxy_manager,
             notification_callback=None,  # Уведомления отправляет Telegram бот
             parsing_service=self.parsing_service,
-            redis_service=self.redis_service
+            redis_service=self.redis_service,
+            rabbitmq_service=self.rabbitmq_service
         )
         
         logger.info("✅ Parsing Worker инициализирован")
@@ -150,6 +166,12 @@ class ParsingWorker:
                 await self.redis_service.disconnect()
             except Exception as e:
                 logger.warning(f"Ошибка при остановке Redis: {e}")
+        
+        if self.rabbitmq_service:
+            try:
+                await self.rabbitmq_service.disconnect()
+            except Exception as e:
+                logger.warning(f"Ошибка при остановке RabbitMQ: {e}")
         
         if self.db_session:
             await self.db_session.close()
@@ -178,14 +200,9 @@ class ParsingWorker:
                 logger.warning(f"⚠️ ParsingWorker: Получено некорректное сообщение (не словарь): {type(message)}")
                 return
             
-            logger.info(f"📥 ParsingWorker: Получено сообщение из Redis: type={message.get('type')}, task_id={message.get('task_id')}, action={message.get('action')}")
-            
-            # Поддерживаем два формата: новый (с type="parsing_task") и старый (с action="parse")
-            if message.get("type") == "parsing_task" or message.get("action") == "parse":
-                # Это задача парсинга, продолжаем обработку
-                pass
-            else:
-                logger.debug(f"   ⏭️ Пропускаем сообщение (не parsing_task): type={message.get('type')}, action={message.get('action')}")
+            # Проверяем, что это задача парсинга
+            if message.get("type") != "parsing_task":
+                logger.debug(f"   ⏭️ Пропускаем сообщение (не parsing_task): type={message.get('type')}")
                 return
             
             task_id = message.get("task_id")
@@ -529,6 +546,31 @@ class ParsingWorker:
                 if task_logger:
                     task_logger.info(f"⏰ Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
                 
+                # ВАЖНО: После успешного выполнения добавляем задачу обратно в RabbitMQ очередь
+                # с задержкой равной check_interval для повторного запуска
+                if self.rabbitmq_service and self.rabbitmq_service.is_connected():
+                    try:
+                        # Формируем данные задачи для повторной публикации
+                        task_data_for_requeue = {
+                            "type": "parsing_task",
+                            "task_id": task_id,
+                            "filters_json": task.filters_json,
+                            "item_name": task.item_name,
+                            "appid": task.appid,
+                            "currency": task.currency
+                        }
+                        
+                        # Публикуем задачу с задержкой (в секундах)
+                        delay_seconds = max(task.check_interval, 10)  # Минимум 10 секунд
+                        await self.rabbitmq_service.requeue_task(task_data_for_requeue, delay_seconds=delay_seconds)
+                        logger.info(f"🔄 ParsingWorker: Задача {task_id} добавлена обратно в очередь для повторного запуска через {delay_seconds}с")
+                        if task_logger:
+                            task_logger.info(f"🔄 Задача добавлена обратно в очередь для повторного запуска через {delay_seconds}с")
+                    except Exception as requeue_error:
+                        logger.warning(f"⚠️ ParsingWorker: Не удалось добавить задачу {task_id} обратно в очередь: {requeue_error}")
+                        if task_logger:
+                            task_logger.warning(f"⚠️ Не удалось добавить задачу обратно в очередь: {requeue_error}")
+                
                 # Обрабатываем результаты парсинга через универсальный сервис
                 # ВАЖНО: Если результаты уже обработаны в параллельном парсере (сразу после нахождения),
                 # то items_list будет пустым, и ResultsProcessorService не будет вызываться
@@ -646,16 +688,18 @@ class ParsingWorker:
             # Очищаем task_id из контекста
             set_task_id(None)
     
-    async def _process_task_with_semaphore(self, message: dict):
+    async def _process_task_with_semaphore_rabbitmq(self, task_data: dict, message: Any):
         """
-        Обрабатывает задачу с использованием семафора для ограничения параллелизма.
+        Обрабатывает задачу из RabbitMQ с использованием семафора.
         
         Args:
-            message: Сообщение с данными задачи
+            task_data: Данные задачи
+            message: Сообщение RabbitMQ (для подтверждения - не используется здесь, подтверждается в task_handler)
         """
         async with self._task_semaphore:
-            # Семафор ограничивает количество одновременных задач
-            await self._process_parsing_task(message)
+            # Обрабатываем задачу
+            # Сообщение будет подтверждено в task_handler после успешной обработки
+            await self._process_parsing_task(task_data)
     
     async def _remove_task(self, task: asyncio.Task):
         """
@@ -684,50 +728,69 @@ class ParsingWorker:
             
             self._running = True
             logger.info("🚀 ParsingWorker: Запущен и готов к работе")
-            logger.info("   📡 Ожидаем задачи из Redis очереди 'parsing_tasks'...")
+            logger.info("   📡 Ожидаем задачи из RabbitMQ очереди 'parsing_tasks'...")
             
-            # Обрабатываем задачи из очереди Redis (BLPOP - блокирующий pop)
             # Параллельная обработка: несколько задач могут выполняться одновременно
-            queue_name = "parsing_tasks"
             logger.info(f"🚀 ParsingWorker: Параллельная обработка включена (макс. {self._task_semaphore._value} одновременных задач)")
             
-            while self._running and not self._shutdown_event.is_set():
+            # Запускаем потребителя RabbitMQ
+            import socket
+            consumer_name = f"worker-{socket.gethostname()}"
+            
+            async def task_handler(task_data: Dict[str, Any], message: Any):
+                """
+                Обработчик задач из RabbitMQ.
+                
+                Args:
+                    task_data: Данные задачи
+                    message: Сообщение RabbitMQ (для подтверждения)
+                """
                 try:
-                    # Читаем из Redis Streams (как Kafka) с consumer group
-                    # Это позволяет распределять задачи между несколькими воркерами (если нужно)
-                    # В данном случае один воркер обрабатывает все задачи параллельно через корутины
-                    import socket
-                    consumer_name = f"worker-{socket.gethostname()}"
-                    message = await self.redis_service.pop_from_queue(
-                        queue_name, 
-                        timeout=1,
-                        consumer_group="parsing_workers",
-                        consumer_name=consumer_name
+                    # Проверяем, что task_data является словарем
+                    if not isinstance(task_data, dict):
+                        logger.warning(f"⚠️ ParsingWorker: Получено некорректное сообщение (не словарь): {type(task_data)}")
+                        await message.ack()  # Подтверждаем некорректное сообщение, чтобы оно не застряло
+                        return
+                    
+                    task_id = task_data.get('task_id')
+                    logger.debug(f"📥 ParsingWorker: Получена задача из RabbitMQ: {task_data.get('type')}, task_id={task_id}")
+                    
+                    # Запускаем обработку задачи в фоне (параллельно)
+                    # Используем семафор для ограничения количества одновременных задач
+                    task = asyncio.create_task(
+                        self._process_task_with_semaphore_rabbitmq(task_data, message)
                     )
-                    if message:
-                        # Проверяем, что message является словарем
-                        if isinstance(message, dict):
-                            task_id = message.get('task_id')
-                            logger.debug(f"📥 ParsingWorker: Получена задача из очереди: {message.get('type')}, task_id={task_id}")
-                            
-                            # Запускаем обработку задачи в фоне (параллельно)
-                            # Используем семафор для ограничения количества одновременных задач
-                            task = asyncio.create_task(
-                                self._process_task_with_semaphore(message)
-                            )
-                            
-                            # Добавляем задачу в отслеживание
-                            async with self._tasks_lock:
-                                self._active_tasks.add(task)
-                            
-                            # Удаляем задачу из отслеживания после завершения
-                            task.add_done_callback(lambda t: asyncio.create_task(self._remove_task(t)))
-                        else:
-                            logger.warning(f"⚠️ ParsingWorker: Получено некорректное сообщение из очереди (не словарь): {type(message)}, значение: {message}")
-                    # Если таймаут - продолжаем цикл (проверяем _running и _shutdown_event)
+                    
+                    # Добавляем задачу в отслеживание
+                    async with self._tasks_lock:
+                        self._active_tasks.add(task)
+                    
+                    # Удаляем задачу из отслеживания после завершения
+                    task.add_done_callback(lambda t: asyncio.create_task(self._remove_task(t)))
+                    
+                    # Ждем завершения задачи перед подтверждением сообщения
+                    try:
+                        await task
+                        # Подтверждаем сообщение только после успешной обработки
+                        await message.ack()
+                        logger.debug(f"✅ ParsingWorker: Задача {task_id} успешно обработана и подтверждена")
+                    except Exception as task_error:
+                        # Ошибка при обработке - пробрасываем для retry механизма
+                        logger.error(f"❌ ParsingWorker: Ошибка при обработке задачи {task_id}: {task_error}")
+                        raise
                 except Exception as e:
-                    logger.error(f"❌ ParsingWorker: Ошибка при получении задачи из очереди: {e}")
-                    await asyncio.sleep(1)  # Небольшая задержка при ошибке
+                    logger.error(f"❌ ParsingWorker: Ошибка в обработчике задач: {e}")
+                    # При ошибке сообщение будет обработано механизмом retry в RabbitMQ
+                    raise  # Пробрасываем ошибку, чтобы RabbitMQ обработал retry
+            
+            # Запускаем потребителя RabbitMQ
+            await self.rabbitmq_service.consume_tasks(
+                callback=task_handler,
+                consumer_name=consumer_name
+            )
+            
+            # Ждем сигнала завершения
+            await self._shutdown_event.wait()
             
             # Ждем завершения всех активных задач перед выходом
             logger.info("⏳ ParsingWorker: Ожидаем завершения активных задач...")

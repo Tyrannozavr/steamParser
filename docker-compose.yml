@@ -31,6 +31,26 @@ services:
       - steam-network
     command: redis-server --appendonly yes
 
+  # RabbitMQ для надежной обработки задач парсинга
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: steam-rabbitmq
+    restart: unless-stopped
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"  # Management UI
+    networks:
+      - steam-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Telegram бот - управление через Telegram
   telegram-bot:
     build:
@@ -43,27 +63,31 @@ services:
     volumes:
       - ./data:/app/data
       - ./migrations:/app/migrations:ro
+      - ./logs:/app/logs
       # ВАЖНО: Файл apply-migrations.sh копируется в образ при сборке (COPY . /app в Dockerfile)
       # Не монтируем файл отдельно - используем версию из образа для надежности
       # Это устраняет проблему, когда файл отсутствует локально у клиента
-      # Логирование в файлы отключено для production
-      # - ./logs:/app/logs
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
       # Уровень логирования: DEBUG, INFO, WARNING, ERROR, CRITICAL
       # Можно переопределить через LOG_LEVEL_TELEGRAM_BOT или общий LOG_LEVEL
+      # В production используем ERROR для уменьшения объема логов
       - LOG_LEVEL=${LOG_LEVEL_TELEGRAM_BOT:-${LOG_LEVEL:-ERROR}}
-      # Логирование в файлы отключено для production
-      # - LOG_DIR=${LOG_DIR:-/app/logs}
+      # Логирование в файлы включено для production (уровень ERROR)
+      - LOG_DIR=${LOG_DIR:-/app/logs}
       - REDIS_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_ENABLED=${RABBITMQ_ENABLED:-true}
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
     networks:
       - steam-network
 
@@ -78,20 +102,22 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      # Логирование в файлы отключено для production
-      # - ./logs:/app/logs
+      - ./logs:/app/logs
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
       # Уровень логирования: DEBUG, INFO, WARNING, ERROR, CRITICAL
       # Можно переопределить через LOG_LEVEL_PARSER_API или общий LOG_LEVEL
+      # В production используем ERROR для уменьшения объема логов
       - LOG_LEVEL=${LOG_LEVEL_PARSER_API:-${LOG_LEVEL:-ERROR}}
-      # Логирование в файлы отключено для production
-      # - LOG_DIR=${LOG_DIR:-/app/logs}
+      # Логирование в файлы включено для production (уровень ERROR)
+      - LOG_DIR=${LOG_DIR:-/app/logs}
       - REDIS_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
     networks:
       - steam-network
     # Порт 8000 скрыт - не нужен вне докера (parser-api используется только внутри сети)
@@ -111,17 +137,19 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      # Логирование в файлы отключено для production
-      # - ./logs:/app/logs
+      - ./logs:/app/logs
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://steam_user:steam_password@postgres:5432/steam_monitor}
       # Уровень логирования: DEBUG, INFO, WARNING, ERROR, CRITICAL
       # Можно переопределить через LOG_LEVEL_PARSING_WORKER или общий LOG_LEVEL
+      # В production используем ERROR для уменьшения объема логов
       - LOG_LEVEL=${LOG_LEVEL_PARSING_WORKER:-${LOG_LEVEL:-ERROR}}
-      # Логирование в файлы отключено для production
-      # - LOG_DIR=${LOG_DIR:-/app/logs}
+      # Логирование в файлы включено для production (уровень ERROR)
+      - LOG_DIR=${LOG_DIR:-/app/logs}
       - REDIS_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_ENABLED=${RABBITMQ_ENABLED:-true}
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
       - ENABLE_MONITORING_SERVICE=${ENABLE_MONITORING_SERVICE:-true}
       # Максимальное количество одновременных задач (параллелизм через корутины)
       - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-10}
@@ -132,6 +160,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
       parser-api:
         condition: service_started
       telegram-bot:
@@ -142,6 +172,7 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  rabbitmq-data:
 
 networks:
   steam-network:

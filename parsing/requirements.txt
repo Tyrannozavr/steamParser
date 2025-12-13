@@ -19,6 +19,9 @@ python-dotenv>=1.0.0
 # Redis
 redis>=5.0.0
 
+# RabbitMQ для надежной обработки задач
+aio-pika>=9.0.0
+
 # FastAPI для Parser API сервиса (используется в listing_parser)
 fastapi>=0.104.0
 

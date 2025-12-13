@@ -606,22 +606,47 @@ async def parse_listings_parallel(
                                 if task and db_manager:
                                     log("info", f"    🔄 Воркер {worker_id}: Найден подходящий предмет, обрабатываем СРАЗУ (task={task.id}, db_manager={db_manager is not None})")
                                     try:
-                                        # Создаем отдельную сессию БД для этого воркера
-                                        worker_db_session = await db_manager.get_session()
+                                        # Создаем отдельную сессию БД для этого воркера с таймаутом
+                                        try:
+                                            worker_db_session = await asyncio.wait_for(
+                                                db_manager.get_session(),
+                                                timeout=10.0  # Таймаут 10 секунд для создания сессии
+                                            )
+                                        except asyncio.TimeoutError:
+                                            log("error", f"    ⏱️ Воркер {worker_id}: Таймаут при создании сессии БД (10с), БД может быть недоступна")
+                                            # В случае ошибки добавляем в список для совместимости
+                                            page_matching_listings.append(parsed_data)
+                                            continue
+                                        except Exception as session_error:
+                                            error_msg = str(session_error)[:200]
+                                            log("error", f"    ❌ Воркер {worker_id}: Ошибка при создании сессии БД: {type(session_error).__name__}: {error_msg}")
+                                            # В случае ошибки добавляем в список для совместимости
+                                            page_matching_listings.append(parsed_data)
+                                            continue
+                                        
                                         try:
                                             from .process_results import process_item_result
                                             
                                             log("info", f"    📝 Воркер {worker_id}: Вызываем process_item_result для немедленной обработки...")
-                                            # Обрабатываем результат сразу (сохранение в БД + отправка уведомления)
-                                            saved = await process_item_result(
-                                                parser=parser,
-                                                task=task,
-                                                parsed_data=parsed_data,
-                                                filters=filters,
-                                                db_session=worker_db_session,
-                                                redis_service=redis_service,
-                                                task_logger=task_logger
-                                            )
+                                            # Обрабатываем результат сразу (сохранение в БД + отправка уведомления) с таймаутом
+                                            try:
+                                                saved = await asyncio.wait_for(
+                                                    process_item_result(
+                                                        parser=parser,
+                                                        task=task,
+                                                        parsed_data=parsed_data,
+                                                        filters=filters,
+                                                        db_session=worker_db_session,
+                                                        redis_service=redis_service,
+                                                        task_logger=task_logger
+                                                    ),
+                                                    timeout=30.0  # Таймаут 30 секунд для обработки результата
+                                                )
+                                            except asyncio.TimeoutError:
+                                                log("error", f"    ⏱️ Воркер {worker_id}: Таймаут при обработке результата (30с), БД может быть недоступна или перегружена")
+                                                # В случае ошибки добавляем в список для совместимости
+                                                page_matching_listings.append(parsed_data)
+                                                continue
                                             
                                             if saved:
                                                 log("info", f"    │ ✅✅✅ ВСЕ ФИЛЬТРЫ ПРОЙДЕНЫ И ПРЕДМЕТ СОХРАНЕН СРАЗУ!")
@@ -635,7 +660,10 @@ async def parse_listings_parallel(
                                                 log("info", f"    └────────────────────────────────────────────────────────────────────")
                                         finally:
                                             # Закрываем сессию воркера
-                                            await worker_db_session.close()
+                                            try:
+                                                await asyncio.wait_for(worker_db_session.close(), timeout=5.0)
+                                            except (asyncio.TimeoutError, Exception) as close_error:
+                                                log("warning", f"    ⚠️ Воркер {worker_id}: Ошибка при закрытии сессии БД: {close_error}")
                                     except Exception as process_error:
                                         error_msg = str(process_error)[:200]
                                         log("error", f"    ⚠️ Ошибка при обработке результата: {type(process_error).__name__}: {error_msg}")

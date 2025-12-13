@@ -147,7 +147,15 @@ class DatabaseManager:
             future=True,
             pool_pre_ping=True,  # Проверка соединения перед использованием
             pool_size=10,  # Размер пула соединений
-            max_overflow=20  # Максимальное количество дополнительных соединений
+            max_overflow=20,  # Максимальное количество дополнительных соединений
+            connect_args={
+                "server_settings": {
+                    "application_name": "steam_monitoring"
+                },
+                "command_timeout": 10,  # Таймаут 10 секунд для команд БД
+            },
+            pool_timeout=10,  # Таймаут 10 секунд для получения соединения из пула
+            pool_recycle=3600,  # Переиспользование соединений каждый час
         )
         self.async_session = async_sessionmaker(
             self.engine,

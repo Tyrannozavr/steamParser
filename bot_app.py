@@ -12,6 +12,7 @@ from loguru import logger
 from core import Config, DatabaseManager
 from services import MonitoringService, ProxyManager
 from services.redis_service import RedisService
+from services.rabbitmq_service import RabbitMQService
 from telegram import TelegramBotManager
 
 # Настройка логирования
@@ -59,6 +60,7 @@ class BotApplication:
         self.monitoring_service: Optional[MonitoringService] = None
         self.telegram_bot: Optional[TelegramBotManager] = None
         self.redis_service: Optional[RedisService] = None
+        self.rabbitmq_service: Optional[RabbitMQService] = None
         self._shutdown_event = asyncio.Event()
         
         # Обработка сигналов
@@ -92,6 +94,19 @@ class BotApplication:
             logger.info("ℹ️ Redis отключен в конфигурации")
             self.redis_service = None
         
+        # Инициализируем RabbitMQ (если включен)
+        if Config.RABBITMQ_ENABLED:
+            try:
+                self.rabbitmq_service = RabbitMQService(rabbitmq_url=Config.RABBITMQ_URL)
+                await self.rabbitmq_service.connect()
+                logger.info(f"✅ RabbitMQ подключен: {Config.RABBITMQ_URL}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось подключиться к RabbitMQ: {e}. Продолжаем без RabbitMQ.")
+                self.rabbitmq_service = None
+        else:
+            logger.info("ℹ️ RabbitMQ отключен в конфигурации")
+            self.rabbitmq_service = None
+        
         # Инициализируем менеджер прокси через фабрику
         from services.proxy_manager_factory import ProxyManagerFactory
         self.proxy_manager = await ProxyManagerFactory.get_instance(
@@ -117,6 +132,7 @@ class BotApplication:
             self.proxy_manager,
             notification_callback=self.telegram_bot.send_notification if not Config.REDIS_ENABLED else None,
             redis_service=self.redis_service,
+            rabbitmq_service=self.rabbitmq_service,
             db_manager=self.db_manager  # Передаем db_manager для создания отдельных сессий в корутинах
         )
         
@@ -140,6 +156,12 @@ class BotApplication:
                 await self.redis_service.stop()
             except Exception as e:
                 logger.warning(f"Ошибка при остановке Redis: {e}")
+        
+        if self.rabbitmq_service:
+            try:
+                await self.rabbitmq_service.disconnect()
+            except Exception as e:
+                logger.warning(f"Ошибка при остановке RabbitMQ: {e}")
         
         if self.db_session:
             await self.db_session.close()
