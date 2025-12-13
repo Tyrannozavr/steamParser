@@ -237,6 +237,74 @@ self.monitoring_service = MonitoringService(
 
 ---
 
+## Дополнительное исправление: Обновление статуса прокси (2025-12-13)
+
+### Проблема
+
+После проверки прокси через команду `/check_proxies` статус в `/status` не обновлялся, показывая "Заблокированных: 0" даже при наличии rate-limited прокси.
+
+### Причина
+
+1. **Метод `get_proxy_stats()` не возвращал ключи `blocked` и `active_blocked`** - в контейнере была старая версия кода
+2. **SQLAlchemy session cache** - сессия кэшировала старые данные и не видела обновления `blocked_until` из других транзакций
+3. **Команда `/status` использовала старую сессию** без явного обновления кэша
+
+### Решение
+
+#### 1. Исправлен метод `get_proxy_stats()`
+
+Добавлены возвращаемые ключи `blocked` и `active_blocked`:
+
+```python
+return {
+    "total": len(all_proxies),
+    "active": len(active_proxies),
+    "inactive": len(all_proxies) - len(active_proxies),
+    "blocked": len(blocked_proxies),  # Все заблокированные
+    "active_blocked": len(active_blocked),  # Активные, но заблокированные (rate limited)
+    "proxies": [...]
+}
+```
+
+#### 2. Добавлен сброс кэша сессии
+
+Перед чтением статистики вызывается `expire_all()` для обновления кэша:
+
+```python
+async def get_proxy_stats(self, db_session=None) -> Dict:
+    # Если используется текущая сессия, сбрасываем кэш
+    if db_session is None:
+        try:
+            await self.db_session.commit()
+        except Exception:
+            pass
+        self.db_session.expire_all()  # Сбрасываем кэш
+```
+
+#### 3. Обновлена команда `/status`
+
+Команда теперь использует новую сессию БД для получения актуальных данных:
+
+```python
+async def cmd_status(self, message: Message):
+    # Создаем новую сессию для получения актуальной статистики
+    session = await self.bot.db_manager.get_session()
+    try:
+        proxy_stats = await self.bot.proxy_manager.get_proxy_stats(db_session=session)
+        active_blocked = proxy_stats.get('active_blocked', 0)
+        # Отображаем статистику
+    finally:
+        await session.close()
+```
+
+### Результаты
+
+✅ **Статус прокси обновляется** после проверки  
+✅ **Правильное отображение** rate-limited прокси в `/status`  
+✅ **Актуальные данные** из БД благодаря новой сессии и сбросу кэша  
+
+---
+
 **Автор:** AI Assistant  
-**Дата:** 2025-12-12  
-**Версия:** 1.0
+**Дата:** 2025-12-12 (обновлено 2025-12-13)  
+**Версия:** 1.1
