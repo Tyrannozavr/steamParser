@@ -1681,7 +1681,7 @@ class ProxyManager:
                                     logger.info(f"✅ Умная проверка: Прокси ID={proxy.id} разблокирован, продолжаем проверять остальные")
                             
                             # Задержка между группами для осторожности
-                            if i + self.BACKGROUND_CHECK_MAX_CONCURRENT < len(blocked_proxies):
+                            if i + self.BACKGROUND_CHECK_MAX_CONCURRENT < len(blocked_proxies_to_check):
                                 await asyncio.sleep(self.BACKGROUND_CHECK_DELAY_BETWEEN_PROXIES)
                         
                         # Сохраняем время последней умной проверки

@@ -29,9 +29,9 @@ def setup_logging(
     """
     log_dir = Path(Config.LOG_DIR)
     
-    # Создаем директорию для логов
+    # Создаем директорию для логов (с родительскими директориями)
     try:
-        log_dir.mkdir(exist_ok=True, mode=0o777)
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
         # Пытаемся установить права доступа
         try:
             import os
@@ -71,11 +71,29 @@ def setup_logging(
     except (OSError, PermissionError) as e:
         logger.warning(f"Не удалось создать файл лога {main_log_file}: {e}.")
     
+    # Отдельный файл для ошибок (ERROR и CRITICAL)
+    errors_log_file = log_dir / f"{service_name}_errors_{{time:YYYY-MM-DD}}.log"
+    try:
+        logger.add(
+            str(errors_log_file),
+            rotation="00:00",  # Ротация в полночь
+            retention="90 days",  # Храним ошибки 90 дней
+            level="ERROR",  # Только ERROR и CRITICAL
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}",
+            encoding="utf-8",
+            enqueue=True,
+            backtrace=True,
+            diagnose=True,
+            filter=lambda record: record["level"].name in ["ERROR", "CRITICAL"]
+        )
+    except (OSError, PermissionError) as e:
+        logger.warning(f"Не удалось создать файл лога ошибок {errors_log_file}: {e}.")
+    
     # Создаем директорию для логов задач, если включено разделение по задачам
     if enable_task_logging:
         tasks_log_dir = log_dir / "tasks"
         try:
-            tasks_log_dir.mkdir(exist_ok=True, mode=0o777)
+            tasks_log_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
             try:
                 import os
                 os.chmod(tasks_log_dir, 0o777)
@@ -160,9 +178,9 @@ class TaskLogger:
         log_dir = Path(Config.LOG_DIR)
         tasks_log_dir = log_dir / "tasks"
         
-        # Создаем директорию, если не существует
+        # Создаем директорию, если не существует (с родительскими директориями)
         try:
-            tasks_log_dir.mkdir(exist_ok=True, mode=0o777)
+            tasks_log_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
             try:
                 import os
                 os.chmod(tasks_log_dir, 0o777)
