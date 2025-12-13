@@ -96,13 +96,30 @@ class ParsingWorker:
             logger.error("   Установите RABBITMQ_ENABLED=true в .env")
             raise ValueError("RabbitMQ должен быть включен для Parsing Worker")
         
-        try:
-            self.rabbitmq_service = RabbitMQService(rabbitmq_url=Config.RABBITMQ_URL)
-            await self.rabbitmq_service.connect()
-            logger.info(f"✅ RabbitMQ подключен: {Config.RABBITMQ_URL}")
-        except Exception as e:
-            logger.error(f"❌ Не удалось подключиться к RabbitMQ: {e}")
-            raise
+        # Пытаемся подключиться к RabbitMQ с retry механизмом
+        # Это позволяет воркеру ждать, пока RabbitMQ запустится (например, после перезагрузки)
+        self.rabbitmq_service = RabbitMQService(rabbitmq_url=Config.RABBITMQ_URL)
+        max_retries = 30  # Максимум 30 попыток
+        retry_delay = 5  # Задержка 5 секунд между попытками
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                await self.rabbitmq_service.connect()
+                logger.info(f"✅ RabbitMQ подключен: {Config.RABBITMQ_URL}")
+                break
+            except Exception as e:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"❌ Не удалось подключиться к RabbitMQ после {max_retries} попыток: {e}")
+                    logger.error(f"   Проверьте, что RabbitMQ запущен и доступен по адресу: {Config.RABBITMQ_URL}")
+                    raise
+                else:
+                    logger.warning(
+                        f"⚠️ Не удалось подключиться к RabbitMQ (попытка {retry_count}/{max_retries}): {e}"
+                    )
+                    logger.info(f"   Повторная попытка через {retry_delay} секунд...")
+                    await asyncio.sleep(retry_delay)
         
         # Инициализируем менеджер прокси с Redis для кэширования (после инициализации Redis)
         # Инициализируем менеджер прокси через фабрику

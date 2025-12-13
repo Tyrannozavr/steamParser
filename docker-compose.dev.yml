@@ -36,6 +36,26 @@ services:
       - steam-network
     command: redis-server --appendonly yes
 
+  # RabbitMQ для надежной обработки задач парсинга
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: steam-rabbitmq
+    restart: unless-stopped
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"  # Management UI
+    networks:
+      - steam-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Telegram бот - управление через Telegram
   telegram-bot:
     build:
@@ -60,11 +80,15 @@ services:
       - LOG_DIR=${LOG_DIR:-/app/logs}
       - REDIS_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_ENABLED=${RABBITMQ_ENABLED:-true}
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
     networks:
       - steam-network
 
@@ -89,6 +113,8 @@ services:
       - LOG_DIR=${LOG_DIR:-/app/logs}
       - REDIS_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_ENABLED=${RABBITMQ_ENABLED:-true}
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
       - ENABLE_MONITORING_SERVICE=${ENABLE_MONITORING_SERVICE:-true}
       # Максимальное количество одновременных задач (параллелизм через корутины)
       - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-10}
@@ -97,6 +123,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
       telegram-bot:
         condition: service_started
     networks:
@@ -120,14 +148,19 @@ services:
       - LOG_DIR=${LOG_DIR:-/app/logs}
       - REDIS_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_ENABLED=${RABBITMQ_ENABLED:-true}
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
     depends_on:
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
     networks:
       - steam-network
 volumes:
   postgres-data:
   redis-data:
+  rabbitmq-data:
 
 networks:
   steam-network:
