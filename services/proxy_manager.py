@@ -1865,31 +1865,81 @@ class ProxyManager:
         # Обновляем кэш в Redis
         await self._update_redis_cache()
     
-    async def get_proxy_stats(self) -> Dict:
+    async def get_proxy_stats(self, db_session=None) -> Dict:
         """
         Получает статистику по прокси.
         ВАЖНО: Читает напрямую из БД, чтобы получить актуальную статистику (не из кэша).
+        
+        Args:
+            db_session: Опциональная сессия БД для использования (если None, используется self.db_session)
         """
+        from datetime import datetime
+        
+        # Используем переданную сессию или текущую
+        session_to_use = db_session if db_session is not None else self.db_session
+        
         # ВАЖНО: Используем отдельную блокировку для БД операций (избегает deadlock при вложенных вызовах)
         async with self._db_lock:
+            # Если используется текущая сессия, сбрасываем кэш
+            if db_session is None:
+                # ВАЖНО: Сбрасываем кэш сессии, чтобы увидеть последние изменения (blocked_until)
+                # Это необходимо, так как изменения могли быть сделаны в другой транзакции
+                try:
+                    await self.db_session.commit()
+                except Exception:
+                    pass  # Игнорируем ошибки, если нет незакоммиченных изменений
+                
+                self.db_session.expire_all()
+            
             # Получаем все прокси напрямую из БД (не из кэша) для актуальной статистики
-            all_proxies_result = await self.db_session.execute(select(Proxy))
+            all_proxies_result = await session_to_use.execute(select(Proxy))
             all_proxies = list(all_proxies_result.scalars().all())
+            
+            now = datetime.now()
             
             # Подсчитываем активные прокси
             active_proxies = [p for p in all_proxies if p.is_active]
             
-            logger.debug(f"📊 ProxyManager: Получена статистика из БД: всего={len(all_proxies)}, активных={len(active_proxies)}")
+            # Подсчитываем заблокированные прокси (blocked_until > now)
+            blocked_proxies = [
+                p for p in all_proxies 
+                if p.blocked_until is not None and p.blocked_until > now
+            ]
+            
+            # Подсчитываем активные, но заблокированные прокси (rate limited)
+            active_blocked = [
+                p for p in active_proxies 
+                if p.blocked_until is not None and p.blocked_until > now
+            ]
+            
+            # Логируем детальную информацию для отладки
+            blocked_ids = [p.id for p in active_blocked]
+            logger.info(
+                f"📊 ProxyManager: Получена статистика из БД (сессия={'новая' if db_session is not None else 'текущая'}): "
+                f"всего={len(all_proxies)}, активных={len(active_proxies)}, "
+                f"заблокированных={len(blocked_proxies)}, активных+заблокированных={len(active_blocked)}"
+            )
+            if len(active_blocked) > 0:
+                logger.info(f"   🔒 Заблокированные прокси (первые 10): {blocked_ids[:10]}")
+            else:
+                # Если заблокированных нет, но должны быть - проверяем несколько прокси вручную
+                sample_proxies = [p for p in active_proxies[:5]]
+                for p in sample_proxies:
+                    logger.debug(f"   🔍 Прокси ID={p.id}: is_active={p.is_active}, blocked_until={p.blocked_until}, now={now}")
             
             return {
                 "total": len(all_proxies),
                 "active": len(active_proxies),
                 "inactive": len(all_proxies) - len(active_proxies),
+                "blocked": len(blocked_proxies),  # Все заблокированные (активные и неактивные)
+                "active_blocked": len(active_blocked),  # Активные, но заблокированные (rate limited)
                 "proxies": [
                     {
                         "id": p.id,
                         "url": p.url[:30] + "..." if len(p.url) > 30 else p.url,
                         "active": p.is_active,
+                        "blocked": p.blocked_until is not None and p.blocked_until > now,
+                        "blocked_until": p.blocked_until.isoformat() if p.blocked_until and p.blocked_until > now else None,
                         "success_count": p.success_count,
                         "fail_count": p.fail_count,
                         "delay": p.delay_seconds,

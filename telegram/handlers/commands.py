@@ -102,26 +102,26 @@ class CommandHandlers:
     async def cmd_status(self, message: Message):
         """Показывает статус системы."""
         stats = await self.bot.monitoring_service.get_statistics()
-        proxy_stats = await self.bot.proxy_manager.get_proxy_stats()
         
-        # Получаем детальную статистику прокси
+        # ВАЖНО: Используем новую сессию БД для получения статистики прокси,
+        # чтобы гарантированно увидеть последние изменения (blocked_until)
         session = await self.bot.db_manager.get_session()
         try:
+            # Передаем новую сессию в get_proxy_stats для чтения актуальных данных
+            proxy_stats = await self.bot.proxy_manager.get_proxy_stats(db_session=session)
             from sqlalchemy import select, func
             from core import Proxy
-            
-            # Подсчитываем заблокированные прокси (с большим количеством ошибок)
-            blocked_proxies_result = await session.execute(
-                select(func.count(Proxy.id))
-                .where(
-                    Proxy.is_active == False
-                )
-            )
-            blocked_count = blocked_proxies_result.scalar() or 0
             
             # Получаем статистику по успешным/неуспешным запросам
             total_success = sum(p.get('success_count', 0) for p in proxy_stats.get('proxies', []))
             total_fail = sum(p.get('fail_count', 0) for p in proxy_stats.get('proxies', []))
+            
+            # Заблокированные прокси (rate limited) - активные, но заблокированные Steam
+            active_blocked = proxy_stats.get('active_blocked', 0)
+            total_blocked = proxy_stats.get('blocked', 0)
+            
+            # Работающие прокси = активные минус заблокированные
+            working_proxies = proxy_stats['active'] - active_blocked
             
             text = f"""
 📊 <b>Статус системы:</b>
@@ -134,14 +134,25 @@ class CommandHandlers:
 <b>Прокси:</b>
 • Всего: {proxy_stats['total']}
 • Активных: {proxy_stats['active']}
+• ⚠️ Заблокированных Steam (rate limited): {active_blocked}
+• ✅ Работающих: {working_proxies}
 • Неактивных: {proxy_stats['inactive']}
-• Заблокированных: {blocked_count}
 • Успешных запросов: {total_success}
 • Ошибок: {total_fail}
 • Успешность: {(total_success / (total_success + total_fail) * 100) if (total_success + total_fail) > 0 else 0:.1f}%
         """
         except Exception as e:
             logger.error(f"Ошибка при получении статистики прокси: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            # В случае ошибки пытаемся получить базовую статистику
+            try:
+                proxy_stats = await self.bot.proxy_manager.get_proxy_stats()
+                active_blocked = proxy_stats.get('active_blocked', 0)
+            except:
+                active_blocked = 0
+                proxy_stats = {'total': 0, 'active': 0, 'inactive': 0}
+            
             text = f"""
 📊 <b>Статус системы:</b>
 
@@ -153,7 +164,9 @@ class CommandHandlers:
 <b>Прокси:</b>
 • Всего: {proxy_stats['total']}
 • Активных: {proxy_stats['active']}
+• ⚠️ Заблокированных Steam (rate limited): {active_blocked}
 • Неактивных: {proxy_stats['inactive']}
+• <i>Ошибка при получении полной статистики</i>
         """
         finally:
             await session.close()
@@ -198,89 +211,76 @@ class CommandHandlers:
             await session.close()
     
     async def cmd_check_proxies(self, message: Message):
-        """Проверяет все прокси на работоспособность параллельно."""
+        """Проверяет все прокси на работоспособность параллельно и обновляет статусы в БД."""
         await message.answer("🔍 Начинаю параллельную проверку прокси... Это может занять некоторое время.")
         
-        import asyncio
-        import httpx
-        from sqlalchemy import select
-        from core import Proxy
+        # ВАЖНО: Используем метод ProxyManager, который обновляет blocked_until в БД
+        if not self.bot.proxy_manager:
+            session = await self.bot.db_manager.get_session()
+            from services import ProxyManager
+            proxy_manager = ProxyManager(session, redis_service=self.bot.redis_service)
+        else:
+            proxy_manager = self.bot.proxy_manager
         
-        async def check_single_proxy(proxy: Proxy) -> dict:
-            """Проверяет один прокси и возвращает результат."""
-            try:
-                # Проверяем прокси через Steam Market API (как в реальном использовании)
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Referer": "https://steamcommunity.com/market/",
-                    "Origin": "https://steamcommunity.com",
-                }
-                async with httpx.AsyncClient(proxy=proxy.url, timeout=15, headers=headers) as client:
-                    # Простой запрос к Steam Market API
-                    response = await client.get(
-                        "https://steamcommunity.com/market/search/render/",
-                        params={"query": "AK-47", "appid": 730, "start": 0, "count": 1, "norender": 1}
-                    )
-                    if response.status_code == 200:
-                        return {"proxy": proxy, "status": "ok", "error": None}
-                    elif response.status_code == 429:
-                        return {"proxy": proxy, "status": "rate_limited", "error": "429 Too Many Requests"}
-                    else:
-                        return {"proxy": proxy, "status": "error", "error": f"HTTP {response.status_code}"}
-            except httpx.ProxyError as e:
-                return {"proxy": proxy, "status": "error", "error": f"Proxy error: {str(e)[:100]}"}
-            except httpx.TimeoutException:
-                return {"proxy": proxy, "status": "error", "error": "Timeout"}
-            except Exception as e:
-                return {"proxy": proxy, "status": "error", "error": f"{type(e).__name__}: {str(e)[:100]}"}
-        
-        session = await self.bot.db_manager.get_session()
         try:
-            # Получаем все прокси
-            result = await session.execute(
-                select(Proxy).order_by(Proxy.id)
+            # Вызываем проверку с обновлением статусов в БД
+            # update_redis_status=True обновляет blocked_until в БД для rate_limited прокси
+            check_result = await proxy_manager.check_all_proxies_parallel(
+                max_concurrent=20,
+                update_redis_status=True  # ВАЖНО: Обновляет blocked_until в БД
             )
-            all_proxies = list(result.scalars().all())
             
-            if not all_proxies:
+            if not check_result or check_result.get("total", 0) == 0:
                 await message.answer("❌ Прокси не найдены в базе данных")
                 return
             
-            # Создаем статус-сообщение для обновления прогресса
-            status_msg = await message.answer(f"🔍 Проверяю {len(all_proxies)} прокси параллельно...")
-            
-            # Создаем задачи для параллельной проверки всех прокси
-            tasks = [check_single_proxy(proxy) for proxy in all_proxies]
-            
-            # Выполняем все проверки параллельно
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Обрабатываем результаты (преобразуем исключения в ошибки)
-            processed_results = []
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    processed_results.append({
-                        "proxy": all_proxies[i],
-                        "status": "error",
-                        "error": f"Exception: {str(result)[:100]}"
-                    })
-                else:
-                    processed_results.append(result)
-            
             # Обновляем статус-сообщение
-            await status_msg.edit_text(f"✅ Проверка завершена! Обрабатываю результаты...")
+            await message.answer("✅ Проверка завершена! Обрабатываю результаты...")
             
-            # Формируем итоговый отчет
-            active_ok = sum(1 for r in processed_results if r["proxy"].is_active and r["status"] == "ok")
-            active_rate_limited = sum(1 for r in processed_results if r["proxy"].is_active and r["status"] == "rate_limited")
-            active_error = sum(1 for r in processed_results if r["proxy"].is_active and r["status"] == "error")
-            inactive_ok = sum(1 for r in processed_results if not r["proxy"].is_active and r["status"] == "ok")
-            inactive_error = sum(1 for r in processed_results if not r["proxy"].is_active and r["status"] == "error")
+            # Получаем детальную информацию о прокси из БД для формирования отчета
+            from sqlalchemy import select
+            from core import Proxy
+            session = await self.bot.db_manager.get_session()
+            try:
+                result = await session.execute(select(Proxy).order_by(Proxy.id))
+                all_proxies = {p.id: p for p in result.scalars().all()}
+            finally:
+                await session.close()
+            
+            # Формируем итоговый отчет на основе результатов проверки
+            working_count = check_result.get("working", 0)
+            rate_limited_count = check_result.get("rate_limited", 0)
+            error_count = check_result.get("error", 0)
+            total_count = check_result.get("total", 0)
+            results = check_result.get("results", [])
+            
+            # Подсчитываем активные прокси по статусам
+            active_ok = 0
+            active_rate_limited = 0
+            active_error = 0
+            inactive_ok = 0
+            inactive_error = 0
+            
+            for r in results:
+                proxy_id = r.get("proxy_id")
+                if proxy_id and proxy_id in all_proxies:
+                    proxy = all_proxies[proxy_id]
+                    status = r.get("status", "error")
+                    if proxy.is_active:
+                        if status == "ok":
+                            active_ok += 1
+                        elif status == "rate_limited":
+                            active_rate_limited += 1
+                        else:
+                            active_error += 1
+                    else:
+                        if status == "ok":
+                            inactive_ok += 1
+                        else:
+                            inactive_error += 1
             
             text = f"📊 <b>Результаты проверки прокси (Steam API):</b>\n\n"
-            text += f"📋 Всего прокси: {len(all_proxies)}\n"
+            text += f"📋 Всего прокси: {total_count}\n"
             text += f"✅ Активных и работающих: {active_ok}\n"
             text += f"⚠️ Активных, но rate limited: {active_rate_limited}\n"
             text += f"❌ Активных, но не работающих: {active_error}\n"
@@ -289,23 +289,28 @@ class CommandHandlers:
             
             if active_rate_limited > 0:
                 text += f"<b>⚠️ Активные прокси с rate limit:</b>\n"
-                for r in processed_results:
-                    if r["proxy"].is_active and r["status"] == "rate_limited":
-                        text += f"   ID={r['proxy'].id}: Steam блокирует (429)\n"
+                for r in results:
+                    if r.get("status") == "rate_limited" and r.get("proxy_id") in all_proxies:
+                        proxy = all_proxies[r.get("proxy_id")]
+                        if proxy.is_active:
+                            text += f"   ID={proxy.id}: Steam блокирует (429)\n"
                 text += "\n"
             
             if active_error > 0:
                 text += f"<b>❌ Активные прокси, которые не работают:</b>\n"
-                for r in processed_results:
-                    if r["proxy"].is_active and r["status"] == "error":
-                        text += f"   ID={r['proxy'].id}: {r['error']}\n"
+                for r in results:
+                    if r.get("status") == "error" and r.get("proxy_id") in all_proxies:
+                        proxy = all_proxies[r.get("proxy_id")]
+                        if proxy.is_active:
+                            error_msg = r.get("error", "Unknown error")
+                            text += f"   ID={proxy.id}: {error_msg[:50]}\n"
             
             await message.answer(text, parse_mode="HTML")
         except Exception as e:
             await message.answer(f"❌ Ошибка при проверке прокси: {str(e)}")
             logger.error(f"Ошибка проверки прокси: {e}")
-        finally:
-            await session.close()
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
     
     async def handle_keyboard_button(self, message: Message, state: FSMContext):
         """Обрабатывает нажатия на кнопки постоянной клавиатуры."""
