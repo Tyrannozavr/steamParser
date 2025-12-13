@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from loguru import logger
 
 import sys
@@ -196,31 +196,55 @@ class MonitoringService:
     
     async def delete_monitoring_task(self, task_id: int) -> bool:
         """Удаляет задачу мониторинга."""
-        result = await self.db_session.execute(
-            select(MonitoringTask).where(MonitoringTask.id == task_id)
-        )
-        task = result.scalar_one_or_none()
-        
-        if not task:
-            return False
-        
-        await self._stop_task_monitoring(task_id)
-        
-        # ВАЖНО: Очищаем флаг выполнения задачи в Redis перед удалением из БД
-        # Это позволяет воркеру корректно обработать сообщения из очереди для удаленной задачи
-        if self.redis_service and self.redis_service.is_connected() and self.redis_service._client:
+        try:
+            result = await self.db_session.execute(
+                select(MonitoringTask).where(MonitoringTask.id == task_id)
+            )
+            task = result.scalar_one_or_none()
+            
+            if not task:
+                logger.warning(f"⚠️ MonitoringService: Задача {task_id} не найдена")
+                return False
+            
+            await self._stop_task_monitoring(task_id)
+            
+            # ВАЖНО: Удаляем все связанные FoundItem перед удалением задачи
+            # Это предотвращает ошибки при удалении задачи с связанными записями
             try:
-                task_running_key = f"parsing_task_running:{task_id}"
-                await self.redis_service._client.delete(task_running_key)
-                logger.debug(f"🔓 MonitoringService: Удален флаг выполнения для задачи {task_id} из Redis")
+                delete_result = await self.db_session.execute(
+                    delete(FoundItem).where(FoundItem.task_id == task_id)
+                )
+                deleted_items_count = delete_result.rowcount
+                if deleted_items_count > 0:
+                    logger.info(f"🗑️ MonitoringService: Удалено {deleted_items_count} найденных предметов для задачи {task_id}")
             except Exception as e:
-                logger.warning(f"⚠️ MonitoringService: Не удалось удалить флаг выполнения для задачи {task_id}: {e}")
-        
-        await self.db_session.delete(task)
-        await self.db_session.commit()
-        
-        logger.info(f"Удалена задача мониторинга: {task_id}")
-        return True
+                logger.warning(f"⚠️ MonitoringService: Не удалось удалить найденные предметы для задачи {task_id}: {e}")
+                # Продолжаем удаление задачи даже если не удалось удалить предметы
+            
+            # ВАЖНО: Очищаем флаг выполнения задачи в Redis перед удалением из БД
+            # Это позволяет воркеру корректно обработать сообщения из очереди для удаленной задачи
+            if self.redis_service and self.redis_service.is_connected() and self.redis_service._client:
+                try:
+                    task_running_key = f"parsing_task_running:{task_id}"
+                    await self.redis_service._client.delete(task_running_key)
+                    logger.debug(f"🔓 MonitoringService: Удален флаг выполнения для задачи {task_id} из Redis")
+                except Exception as e:
+                    logger.warning(f"⚠️ MonitoringService: Не удалось удалить флаг выполнения для задачи {task_id}: {e}")
+            
+            await self.db_session.delete(task)
+            await self.db_session.commit()
+            
+            logger.info(f"✅ MonitoringService: Удалена задача мониторинга: {task_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ MonitoringService: Ошибка при удалении задачи {task_id}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            try:
+                await self.db_session.rollback()
+            except Exception:
+                pass
+            raise  # Пробрасываем ошибку дальше для обработки в Telegram боте
     
     async def get_all_tasks(self, active_only: bool = False) -> List[MonitoringTask]:
         """Получает все задачи мониторинга."""
