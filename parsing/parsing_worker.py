@@ -606,12 +606,29 @@ class ParsingWorker:
                             redis_service=self.redis_service
                         )
                         
-                        found_count = await results_processor.process_results(
-                            task=task,
-                            items=items_list,
-                            task_logger=task_logger
-                        )
-                        # results_processor.process_results уже делает commit, который сохранит все изменения задачи
+                        try:
+                            found_count = await results_processor.process_results(
+                                task=task,
+                                items=items_list,
+                                task_logger=task_logger
+                            )
+                            # results_processor.process_results уже делает commit, который сохранит все изменения задачи
+                        except Exception as process_error:
+                            # ВАЖНО: Если results_processor падает, все равно сохраняем изменения задачи
+                            # (total_checks, last_check, next_check) чтобы счетчик проверок не терялся
+                            logger.error(f"❌ ParsingWorker: Ошибка в results_processor для задачи {task_id}: {process_error}")
+                            if task_logger:
+                                task_logger.error(f"❌ Ошибка при обработке результатов: {process_error}")
+                            try:
+                                await task_db_session.commit()
+                                logger.info(f"✅ ParsingWorker: Задача {task_id} обновлена в БД после ошибки results_processor: проверок={task.total_checks}, найдено={task.items_found}")
+                            except Exception as commit_error:
+                                logger.error(f"❌ ParsingWorker: Ошибка при сохранении задачи {task_id} после ошибки results_processor: {commit_error}")
+                                try:
+                                    await task_db_session.rollback()
+                                except Exception:
+                                    pass
+                            found_count = 0  # Не нашли предметов из-за ошибки
                     else:
                         logger.info(f"ℹ️ ParsingWorker: Список предметов пуст - результаты уже обработаны в параллельном парсере (уведомления отправлены сразу)")
                         task_logger.info(f"ℹ️ Результаты уже обработаны, уведомления отправлены сразу")

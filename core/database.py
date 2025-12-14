@@ -152,7 +152,7 @@ class DatabaseManager:
                 "server_settings": {
                     "application_name": "steam_monitoring"
                 },
-                "command_timeout": 10,  # Таймаут 10 секунд для команд БД
+                "command_timeout": 30,  # Таймаут 30 секунд для команд БД (увеличено для надежности)
             },
             pool_timeout=10,  # Таймаут 10 секунд для получения соединения из пула
             pool_recycle=3600,  # Переиспользование соединений каждый час
