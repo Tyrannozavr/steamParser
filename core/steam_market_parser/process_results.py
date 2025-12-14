@@ -6,7 +6,7 @@
 import asyncio
 import json
 from typing import Optional, Dict, Any
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
@@ -34,7 +34,7 @@ async def process_item_result(
             # Пытаемся загрузить task в текущей сессии с таймаутом
             task = await asyncio.wait_for(
                 db_session.get(MonitoringTask, task.id),
-                timeout=10.0  # Таймаут 10 секунд для загрузки задачи
+                timeout=30.0  # Увеличено: Таймаут 30 секунд для загрузки задачи (было 10)
             )
             if not task:
                 logger.error(f"❌ Задача {task.id if hasattr(task, 'id') else 'unknown'} не найдена в БД")
@@ -411,7 +411,7 @@ async def process_item_result(
                     db_session.execute(
                         select(FoundItem).where(FoundItem.task_id == task.id)
                     ),
-                    timeout=10.0  # Таймаут 10 секунд для запроса к БД
+                    timeout=30.0  # Увеличено: Таймаут 30 секунд для запроса к БД (было 10)
                 )
                 for existing_item in all_task_items.scalars().all():
                     try:
@@ -447,7 +447,7 @@ async def process_item_result(
                 )
                 existing_items = await asyncio.wait_for(
                     db_session.execute(existing_query),
-                    timeout=10.0  # Таймаут 10 секунд для запроса к БД
+                    timeout=30.0  # Увеличено: Таймаут 30 секунд для запроса к БД (было 10)
                 )
                 for existing_item in existing_items.scalars().all():
                     try:
@@ -483,7 +483,7 @@ async def process_item_result(
                 )
                 existing = await asyncio.wait_for(
                     db_session.execute(existing_query.limit(1)),
-                    timeout=10.0  # Таймаут 10 секунд для запроса к БД
+                    timeout=30.0  # Увеличено: Таймаут 30 секунд для запроса к БД (было 10)
                 )
                 if existing.scalar_one_or_none():
                     logger.info(f"⏭️ Предмет уже существует в БД, пропускаем: {item_name} (${item_price:.2f})")
@@ -518,58 +518,100 @@ async def process_item_result(
             notification_sent=False
         )
         
+        # ВАЖНО: Отправляем уведомление ДО сохранения в БД, чтобы оно ушло даже при таймауте
+        notification_sent = False
+        if redis_service and redis_service.is_connected():
+            try:
+                # Подготавливаем данные для уведомления (без ID предмета, т.к. он еще не сохранен)
+                notification_data = {
+                    "type": "found_item",
+                    "item_id": None,  # Будет установлен после сохранения
+                    "task_id": task.id,
+                    "item_name": item_name,
+                    "price": item_price,
+                    "market_url": item_name,
+                    "item_data_json": json.dumps(serialized_data, ensure_ascii=False),
+                    "task_name": task.name
+                }
+                logger.info(f"📤 Публикуем уведомление в Redis канал 'found_items' для предмета {item_name} (ДО сохранения в БД)")
+                if task_logger:
+                    task_logger.info(f"📤 Публикуем уведомление в Telegram")
+                
+                await redis_service.publish("found_items", notification_data)
+                notification_sent = True
+                logger.info(f"✅ Уведомление опубликовано для предмета {item_name} (ДО сохранения)")
+                if task_logger:
+                    task_logger.success(f"✅ Уведомление отправлено в Telegram")
+            except Exception as notify_error:
+                logger.warning(f"⚠️ Не удалось отправить уведомление ДО сохранения: {notify_error}, попробуем после")
+        
         try:
             db_session.add(found_item)
             await asyncio.wait_for(
                 db_session.flush(),  # Получаем ID предмета
-                timeout=10.0  # Таймаут 10 секунд для flush
+                timeout=30.0  # Увеличено: Таймаут 30 секунд для flush (было 10)
             )
             
-            # Обновляем счетчик найденных предметов в задаче
-            await asyncio.wait_for(
-                db_session.refresh(task),
-                timeout=10.0  # Таймаут 10 секунд для refresh
+            # ВАЖНО: Используем атомарный UPDATE вместо refresh + изменение + commit
+            # Это предотвращает блокировки и race conditions
+            update_query = update(MonitoringTask).where(
+                MonitoringTask.id == task.id
+            ).values(
+                items_found=MonitoringTask.items_found + 1,
+                total_checks=MonitoringTask.total_checks + 1
             )
-            task.items_found += 1
-            task.total_checks += 1
+            
+            await asyncio.wait_for(
+                db_session.execute(update_query),
+                timeout=30.0  # Увеличено: Таймаут 30 секунд для UPDATE (было 10)
+            )
             
             # Сохраняем изменения в БД
             await asyncio.wait_for(
                 db_session.commit(),
-                timeout=10.0  # Таймаут 10 секунд для commit
+                timeout=30.0  # Увеличено: Таймаут 30 секунд для commit (было 10)
             )
             
             logger.info(f"💾 Предмет сохранен в БД: {item_name} (${item_price:.2f}), ID={found_item.id}")
             if task_logger:
                 task_logger.success(f"💾 Предмет сохранен в БД: {item_name} (${item_price:.2f})")
             
-            # Публикуем уведомление в Redis сразу
-            if redis_service and redis_service.is_connected():
-                notification_data = {
-                    "type": "found_item",
-                    "item_id": found_item.id,
-                    "task_id": task.id,
-                    "item_name": found_item.item_name,
-                    "price": found_item.price,
-                    "market_url": found_item.market_url,
-                    "item_data_json": found_item.item_data_json,
-                    "task_name": task.name
-                }
-                logger.info(f"📤 Публикуем уведомление в Redis канал 'found_items' для предмета {found_item.id}")
-                if task_logger:
-                    task_logger.info(f"📤 Публикуем уведомление в Telegram")
-                
-                await redis_service.publish("found_items", notification_data)
-                logger.info(f"✅ Уведомление опубликовано для предмета {found_item.id}")
-                if task_logger:
-                    task_logger.success(f"✅ Уведомление отправлено в Telegram")
+            # Если уведомление не было отправлено ДО сохранения, отправляем после
+            if not notification_sent and redis_service and redis_service.is_connected():
+                try:
+                    notification_data = {
+                        "type": "found_item",
+                        "item_id": found_item.id,
+                        "task_id": task.id,
+                        "item_name": found_item.item_name,
+                        "price": found_item.price,
+                        "market_url": found_item.market_url,
+                        "item_data_json": found_item.item_data_json,
+                        "task_name": task.name
+                    }
+                    await redis_service.publish("found_items", notification_data)
+                    logger.info(f"✅ Уведомление опубликовано для предмета {found_item.id} (после сохранения)")
+                    if task_logger:
+                        task_logger.success(f"✅ Уведомление отправлено в Telegram")
+                except Exception as notify_error:
+                    logger.warning(f"⚠️ Не удалось отправить уведомление после сохранения: {notify_error}")
             
             return True
             
         except asyncio.TimeoutError:
-            logger.error(f"⏱️ Таймаут при сохранении предмета {item_name} в БД (10с), БД может быть недоступна или перегружена")
+            logger.error(f"⏱️ Таймаут при сохранении предмета {item_name} в БД (30с), БД может быть недоступна или перегружена")
             if task_logger:
                 task_logger.error(f"⏱️ Таймаут при сохранении")
+            # ВАЖНО: Уведомление уже отправлено, поэтому возвращаем True
+            if notification_sent:
+                logger.warning(f"⚠️ Предмет не сохранен в БД из-за таймаута, но уведомление уже отправлено")
+                if task_logger:
+                    task_logger.warning(f"⚠️ Предмет не сохранен, но уведомление отправлено")
+                try:
+                    await asyncio.wait_for(db_session.rollback(), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                return True  # Возвращаем True, т.к. уведомление отправлено
             try:
                 await asyncio.wait_for(db_session.rollback(), timeout=5.0)
             except (asyncio.TimeoutError, Exception):

@@ -146,15 +146,17 @@ class DatabaseManager:
             echo=False,  # Установить True для отладки SQL запросов
             future=True,
             pool_pre_ping=True,  # Проверка соединения перед использованием
-            pool_size=10,  # Размер пула соединений
-            max_overflow=20,  # Максимальное количество дополнительных соединений
+            pool_size=20,  # Увеличено: Размер пула соединений (было 10)
+            max_overflow=40,  # Увеличено: Максимальное количество дополнительных соединений (было 20)
             connect_args={
                 "server_settings": {
-                    "application_name": "steam_monitoring"
+                    "application_name": "steam_monitoring",
+                    # ВАЖНО: Устанавливаем уровень изоляции READ COMMITTED для уменьшения блокировок
+                    "default_transaction_isolation": "read committed"
                 },
-                "command_timeout": 30,  # Таймаут 30 секунд для команд БД (увеличено для надежности)
+                "command_timeout": 60,  # Увеличено: Таймаут 60 секунд для команд БД (было 30)
             },
-            pool_timeout=10,  # Таймаут 10 секунд для получения соединения из пула
+            pool_timeout=30,  # Увеличено: Таймаут 30 секунд для получения соединения из пула (было 10)
             pool_recycle=3600,  # Переиспользование соединений каждый час
         )
         self.async_session = async_sessionmaker(
