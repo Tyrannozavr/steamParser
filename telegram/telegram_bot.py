@@ -893,8 +893,65 @@ class TelegramBotManager:
                 logger.info(f"🔔 TelegramBot: Обрабатываем уведомление о найденном предмете: item_id={item_id}, task_id={task_id}")
                 task_logger.info(f"🔔 Обрабатываем уведомление о найденном предмете: item_id={item_id}")
                 
+                # ВАЖНО: Если item_id=None или строка "None", это означает, что уведомление было отправлено ДО сохранения в БД
+                # В этом случае используем данные из сообщения напрямую
+                # Проверяем разные варианты: None, строка "None", пустая строка
+                if item_id is None or item_id == "None" or (isinstance(item_id, str) and item_id.lower() == "none") or item_id == "":
+                    logger.warning(f"⚠️ TelegramBot: item_id=None в уведомлении, используем данные из сообщения напрямую")
+                    task_logger.warning(f"⚠️ item_id=None, используем данные из сообщения")
+                    
+                    # Получаем данные из сообщения
+                    item_name = message.get("item_name")
+                    price = message.get("price")
+                    item_data_json = message.get("item_data_json")
+                    market_url = message.get("market_url")
+                    task_name = message.get("task_name")
+                    
+                    if not item_name or not price or task_id is None:
+                        logger.error(f"❌ TelegramBot: Недостаточно данных в уведомлении (item_name={item_name}, price={price}, task_id={task_id})")
+                        task_logger.error(f"❌ Недостаточно данных в уведомлении")
+                        return
+                    
+                    # Загружаем задачу из БД
+                    session = await self.db_manager.get_session()
+                    try:
+                        task = await session.get(MonitoringTask, task_id)
+                        if not task:
+                            logger.error(f"❌ TelegramBot: Задача {task_id} не найдена в БД")
+                            task_logger.error(f"❌ Задача {task_id} не найдена в БД")
+                            return
+                        
+                        # Отправляем уведомление напрямую, используя данные из сообщения
+                        # Создаем временный объект FoundItem для отправки уведомления
+                        from core.database import FoundItem
+                        temp_item = FoundItem(
+                            id=None,  # Временный объект, не сохранен в БД
+                            task_id=task_id,
+                            item_name=item_name,
+                            price=float(price),
+                            item_data_json=item_data_json or "{}",
+                            market_url=market_url,
+                            notification_sent=False,
+                            found_at=datetime.now()
+                        )
+                        
+                        logger.info(f"📤 TelegramBot: Отправляем уведомление напрямую (item_id=None): {item_name}, ${price}")
+                        task_logger.info(f"📤 Отправляем уведомление напрямую: {item_name}, ${price}")
+                        await self.send_notification(temp_item, task)
+                        logger.info(f"✅ TelegramBot: Уведомление отправлено (item_id=None)")
+                        task_logger.success(f"✅ Уведомление отправлено")
+                    finally:
+                        await session.close()
+                    return
+                
                 # Получаем данные из БД (используем данные из сообщения, чтобы избежать лишнего запроса)
                 # Но все равно загружаем из БД для проверки и обновления статуса
+                # ВАЖНО: Проверяем, что item_id не None и не строка "None"
+                if item_id is None or item_id == "None" or (isinstance(item_id, str) and item_id.lower() == "none"):
+                    logger.warning(f"⚠️ TelegramBot: item_id={item_id} невалиден, пропускаем загрузку из БД")
+                    task_logger.warning(f"⚠️ item_id={item_id} невалиден, пропускаем")
+                    return
+                
                 session = await self.db_manager.get_session()
                 try:
                     from sqlalchemy import select

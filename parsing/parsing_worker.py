@@ -620,8 +620,17 @@ class ParsingWorker:
                             if task_logger:
                                 task_logger.error(f"❌ Ошибка при обработке результатов: {process_error}")
                             try:
-                                await task_db_session.commit()
+                                await asyncio.wait_for(
+                                    task_db_session.commit(),
+                                    timeout=10.0  # Таймаут 10 секунд для commit
+                                )
                                 logger.info(f"✅ ParsingWorker: Задача {task_id} обновлена в БД после ошибки results_processor: проверок={task.total_checks}, найдено={task.items_found}")
+                            except asyncio.TimeoutError:
+                                logger.error(f"⏱️ ParsingWorker: Таймаут при сохранении задачи {task_id} после ошибки (10с), БД может быть перегружена")
+                                try:
+                                    await task_db_session.rollback()
+                                except Exception:
+                                    pass
                             except Exception as commit_error:
                                 logger.error(f"❌ ParsingWorker: Ошибка при сохранении задачи {task_id} после ошибки results_processor: {commit_error}")
                                 try:
@@ -642,10 +651,19 @@ class ParsingWorker:
                     
                     # Если предметы не найдены, results_processor не вызывается, нужно сохранить изменения вручную
                     try:
-                        await task_db_session.commit()
+                        await asyncio.wait_for(
+                            task_db_session.commit(),
+                            timeout=10.0  # Таймаут 10 секунд для commit
+                        )
                         logger.info(f"✅ ParsingWorker: Задача {task_id} обновлена в БД: проверок={task.total_checks}, найдено={task.items_found}, next_check={task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
                         if task_logger:
                             task_logger.info(f"✅ Задача обновлена: проверок={task.total_checks}, найдено={task.items_found}")
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏱️ ParsingWorker: Таймаут при сохранении задачи {task_id} (10с), БД может быть перегружена")
+                        try:
+                            await task_db_session.rollback()
+                        except Exception:
+                            pass
                     except Exception as commit_error:
                         logger.error(f"❌ ParsingWorker: Ошибка при сохранении задачи {task_id} в БД: {commit_error}")
                         if task_logger:

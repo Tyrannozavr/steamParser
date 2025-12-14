@@ -687,13 +687,28 @@ class MonitoringService:
             next_check = now + timedelta(seconds=check_interval)
             
             # Обновляем через UPDATE запрос, чтобы избежать проблем с ORM
-            await session.execute(
-                update(MonitoringTask)
-                .where(MonitoringTask.id == task_id)
-                .values(next_check=next_check)
-            )
-            await session.commit()
-            logger.info(f"⏰ Задача {task_id}: Следующая проверка в {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+            # ВАЖНО: Добавляем таймаут для предотвращения долгих блокировок
+            try:
+                await asyncio.wait_for(
+                    session.execute(
+                        update(MonitoringTask)
+                        .where(MonitoringTask.id == task_id)
+                        .values(next_check=next_check)
+                    ),
+                    timeout=10.0  # Таймаут 10 секунд для UPDATE запроса
+                )
+                await asyncio.wait_for(
+                    session.commit(),
+                    timeout=5.0  # Таймаут 5 секунд для commit
+                )
+                logger.info(f"⏰ Задача {task_id}: Следующая проверка в {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+            except asyncio.TimeoutError:
+                logger.error(f"⏱️ Задача {task_id}: Таймаут при обновлении next_check (10с), БД может быть перегружена")
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                raise  # Пробрасываем исключение для обработки выше
         except Exception as e:
             logger.error(f"❌ Задача {task_id}: Ошибка при обновлении next_check: {e}")
             try:

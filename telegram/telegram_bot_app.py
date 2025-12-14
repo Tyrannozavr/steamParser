@@ -126,13 +126,34 @@ class TelegramBotApplication:
         
         # Инициализируем RabbitMQ (если включен)
         if Config.RABBITMQ_ENABLED:
-            try:
-                self.rabbitmq_service = RabbitMQService(rabbitmq_url=Config.RABBITMQ_URL)
-                await self.rabbitmq_service.connect()
-                logger.info(f"✅ RabbitMQ подключен: {Config.RABBITMQ_URL}")
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось подключиться к RabbitMQ: {e}. Продолжаем без RabbitMQ.")
-                self.rabbitmq_service = None
+            # Пытаемся подключиться к RabbitMQ с retry механизмом
+            # Это позволяет боту ждать, пока RabbitMQ запустится (например, после перезагрузки)
+            self.rabbitmq_service = RabbitMQService(rabbitmq_url=Config.RABBITMQ_URL)
+            max_retries = 30  # Максимум 30 попыток
+            retry_delay = 5  # Задержка 5 секунд между попытками
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    await self.rabbitmq_service.connect()
+                    logger.info(f"✅ RabbitMQ подключен: {Config.RABBITMQ_URL}")
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        logger.error(f"❌ Не удалось подключиться к RabbitMQ после {max_retries} попыток: {e}")
+                        logger.error(f"   Проверьте, что RabbitMQ запущен и доступен по адресу: {Config.RABBITMQ_URL}")
+                        logger.warning(f"⚠️ Продолжаем без RabbitMQ. Некоторые функции могут быть недоступны.")
+                        logger.warning(f"⚠️ Бот будет пытаться переподключиться к RabbitMQ при следующей операции.")
+                        # ВАЖНО: НЕ устанавливаем rabbitmq_service = None, чтобы можно было переподключиться позже
+                        # Сервис останется, но будет не подключен - метод ensure_connected() попытается переподключиться
+                        break
+                    else:
+                        logger.warning(
+                            f"⚠️ Не удалось подключиться к RabbitMQ (попытка {retry_count}/{max_retries}): {e}"
+                        )
+                        logger.info(f"   Повторная попытка через {retry_delay} секунд...")
+                        await asyncio.sleep(retry_delay)
         else:
             logger.info("ℹ️ RabbitMQ отключен в конфигурации")
             self.rabbitmq_service = None
