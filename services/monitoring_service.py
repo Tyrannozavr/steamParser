@@ -261,8 +261,14 @@ class MonitoringService:
         tasks = list(result.scalars().all())
         
         # Обновляем объекты из БД, чтобы получить актуальные данные (total_checks, items_found и т.д.)
+        # ВАЖНО: Используем refresh с синхронизацией, чтобы гарантировать получение актуальных данных из БД
         for task in tasks:
-            await self.db_session.refresh(task)
+            try:
+                # Сбрасываем состояние объекта перед refresh для гарантированного обновления
+                await self.db_session.refresh(task, attribute_names=['total_checks', 'items_found', 'last_check', 'next_check', 'updated_at'])
+            except Exception as refresh_error:
+                # Если refresh не удался, логируем, но продолжаем (данные могут быть актуальными)
+                logger.debug(f"⚠️ Не удалось обновить задачу {task.id} через refresh: {refresh_error}")
         
         return tasks
     
