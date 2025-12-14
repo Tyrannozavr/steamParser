@@ -3,7 +3,7 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: steam-postgres
-    restart: unless-stopped
+    restart: always
     environment:
       - POSTGRES_DB=${POSTGRES_DB:-steam_monitor}
       - POSTGRES_USER=${POSTGRES_USER:-steam_user}
@@ -24,7 +24,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: steam-redis
-    restart: unless-stopped
+    restart: always
     volumes:
       - redis-data:/data
     networks:
@@ -35,7 +35,7 @@ services:
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: steam-rabbitmq
-    restart: unless-stopped
+    restart: always
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
@@ -57,7 +57,7 @@ services:
       context: .
       dockerfile: telegram/Dockerfile
     container_name: steam-telegram-bot
-    restart: unless-stopped
+    restart: always
     env_file:
       - .env
     volumes:
@@ -97,7 +97,7 @@ services:
       context: .
       dockerfile: parser_api/Dockerfile
     container_name: steam-parser-api
-    restart: unless-stopped
+    restart: always
     env_file:
       - .env
     volumes:
@@ -132,7 +132,7 @@ services:
       context: .
       dockerfile: parsing/Dockerfile
     container_name: steam-parsing-worker
-    restart: unless-stopped
+    restart: always
     env_file:
       - .env
     volumes:
