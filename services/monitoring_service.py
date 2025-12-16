@@ -252,25 +252,66 @@ class MonitoringService:
             raise  # Пробрасываем ошибку дальше для обработки в Telegram боте
     
     async def get_all_tasks(self, active_only: bool = False) -> List[MonitoringTask]:
-        """Получает все задачи мониторинга."""
-        query = select(MonitoringTask)
-        if active_only:
-            query = query.where(MonitoringTask.is_active == True)
+        """
+        Получает все задачи мониторинга.
         
-        result = await self.db_session.execute(query.order_by(MonitoringTask.id))
-        tasks = list(result.scalars().all())
-        
-        # Обновляем объекты из БД, чтобы получить актуальные данные (total_checks, items_found и т.д.)
-        # ВАЖНО: Используем refresh с синхронизацией, чтобы гарантировать получение актуальных данных из БД
-        for task in tasks:
+        ВАЖНО: Использует отдельную сессию БД для предотвращения ошибок "connection is closed".
+        """
+        # ВАЖНО: Создаем отдельную сессию для этого запроса, чтобы избежать проблем с закрытыми соединениями
+        # Если db_manager доступен, используем его, иначе используем общую сессию с блокировкой
+        if self.db_manager:
+            session = await self.db_manager.get_session()
             try:
-                # Сбрасываем состояние объекта перед refresh для гарантированного обновления
-                await self.db_session.refresh(task, attribute_names=['total_checks', 'items_found', 'last_check', 'next_check', 'updated_at'])
-            except Exception as refresh_error:
-                # Если refresh не удался, логируем, но продолжаем (данные могут быть актуальными)
-                logger.debug(f"⚠️ Не удалось обновить задачу {task.id} через refresh: {refresh_error}")
-        
-        return tasks
+                query = select(MonitoringTask)
+                if active_only:
+                    query = query.where(MonitoringTask.is_active == True)
+                
+                result = await session.execute(query.order_by(MonitoringTask.id))
+                tasks = list(result.scalars().all())
+                
+                # Обновляем объекты из БД, чтобы получить актуальные данные (total_checks, items_found и т.д.)
+                # ВАЖНО: Используем refresh с синхронизацией, чтобы гарантировать получение актуальных данных из БД
+                for task in tasks:
+                    try:
+                        # Сбрасываем состояние объекта перед refresh для гарантированного обновления
+                        await session.refresh(task, attribute_names=['total_checks', 'items_found', 'last_check', 'next_check', 'updated_at'])
+                    except Exception as refresh_error:
+                        # Если refresh не удался, логируем, но продолжаем (данные могут быть актуальными)
+                        logger.debug(f"⚠️ Не удалось обновить задачу {task.id} через refresh: {refresh_error}")
+                
+                return tasks
+            finally:
+                await session.close()
+        else:
+            # Fallback: используем общую сессию с блокировкой (менее надежно)
+            async with self._session_lock:
+                try:
+                    query = select(MonitoringTask)
+                    if active_only:
+                        query = query.where(MonitoringTask.is_active == True)
+                    
+                    result = await self.db_session.execute(query.order_by(MonitoringTask.id))
+                    tasks = list(result.scalars().all())
+                    
+                    # Обновляем объекты из БД
+                    for task in tasks:
+                        try:
+                            await self.db_session.refresh(task, attribute_names=['total_checks', 'items_found', 'last_check', 'next_check', 'updated_at'])
+                        except Exception as refresh_error:
+                            logger.debug(f"⚠️ Не удалось обновить задачу {task.id} через refresh: {refresh_error}")
+                    
+                    return tasks
+                except Exception as e:
+                    error_msg = str(e)
+                    if "connection is closed" in error_msg.lower() or "InterfaceError" in str(type(e).__name__):
+                        logger.error(f"❌ MonitoringService: Соединение с БД закрыто при получении задач: {e}")
+                        logger.error("   Это может произойти, если сессия была закрыта в другой корутине")
+                        logger.error("   Рекомендуется передать db_manager в MonitoringService для создания отдельных сессий")
+                    else:
+                        logger.error(f"❌ MonitoringService: Ошибка при получении задач: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+                    return []
     
     async def _start_task_monitoring(self, task: MonitoringTask):
         """Запускает мониторинг для задачи."""
