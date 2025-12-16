@@ -184,13 +184,24 @@ class RabbitMQService:
         if self.is_connected():
             return True
         
-        # Пытаемся переподключиться
-        try:
-            await self.connect()
-            return True
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось переподключиться к RabbitMQ: {e}")
-            return False
+        # Пытаемся переподключиться с несколькими попытками
+        max_retries = 3
+        retry_delay = 2  # 2 секунды между попытками
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🔄 RabbitMQ: Попытка переподключения ({attempt + 1}/{max_retries})...")
+                await self.connect()
+                logger.info(f"✅ RabbitMQ: Успешно переподключен после {attempt + 1} попытки")
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ RabbitMQ: Не удалось переподключиться (попытка {attempt + 1}/{max_retries}): {e}")
+                    logger.info(f"   Повторная попытка через {retry_delay} секунд...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.warning(f"⚠️ RabbitMQ: Не удалось переподключиться после {max_retries} попыток: {e}")
+                    return False
+        return False
     
     async def publish_task(self, task_data: Dict[str, Any], priority: int = 0, delay_seconds: int = 0):
         """

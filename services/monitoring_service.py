@@ -445,6 +445,7 @@ class MonitoringService:
                         # Публикуем задачу в RabbitMQ для Parsing Worker
                         # ВАЖНО: Redis используется только для флагов выполнения (parsing_task_running),
                         # а задачи публикуются в RabbitMQ
+                        # ВАЖНО: Сначала проверяем, есть ли сервис, затем пытаемся переподключиться
                         if not self.rabbitmq_service:
                             logger.error(f"❌ Задача {task_id}: RabbitMQ сервис не инициализирован, пропускаем эту проверку")
                             await self._update_next_check_safe(task_id, task_session, task.check_interval)
@@ -452,8 +453,9 @@ class MonitoringService:
                             continue
                         
                         # Пытаемся переподключиться, если соединение потеряно
+                        # ВАЖНО: ensure_connected() пытается переподключиться автоматически
                         if not await self.rabbitmq_service.ensure_connected():
-                            logger.error(f"❌ Задача {task_id}: RabbitMQ недоступен, пропускаем эту проверку")
+                            logger.warning(f"⚠️ Задача {task_id}: RabbitMQ недоступен, пропускаем эту проверку (будет повторная попытка при следующей проверке)")
                             await self._update_next_check_safe(task_id, task_session, task.check_interval)
                             await asyncio.sleep(task.check_interval)
                             continue
@@ -590,10 +592,11 @@ class MonitoringService:
                                         await self._update_next_check_safe(task_id, task_session, task.check_interval)
                                         await asyncio.sleep(task.check_interval)
                                         continue
-                                    
+
                                     # Пытаемся переподключиться, если соединение потеряно
+                                    # ВАЖНО: ensure_connected() пытается переподключиться автоматически
                                     if not await self.rabbitmq_service.ensure_connected():
-                                        logger.error(f"❌ Задача {task_id}: RabbitMQ недоступен, задача не может быть добавлена в очередь")
+                                        logger.warning(f"⚠️ Задача {task_id}: RabbitMQ недоступен, задача не может быть добавлена в очередь (будет повторная попытка при следующей проверке)")
                                         # Пропускаем эту итерацию, попробуем в следующий раз
                                         await self._update_next_check_safe(task_id, task_session, task.check_interval)
                                         await asyncio.sleep(task.check_interval)
