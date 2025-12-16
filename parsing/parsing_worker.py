@@ -535,33 +535,56 @@ class ParsingWorker:
                         task_logger.debug(f"ℹ️ result.get('items') пустой, но success=True (не нашлось подходящих лотов) - это нормально")
                 
                 # Обновляем статистику задачи (всегда, даже если предметы не найдены)
-                # ВАЖНО: Обновляем объект через refresh перед изменением, чтобы избежать проблем с async контекстом
+                # ВАЖНО: Используем атомарный UPDATE вместо ORM для предотвращения блокировок
+                # Это позволяет избежать конфликтов с другими процессами, которые обновляют ту же задачу
+                from datetime import timedelta
+                from sqlalchemy import update
+                now = datetime.now()
+                next_check = now + timedelta(seconds=task.check_interval)
+                
                 try:
-                    await task_db_session.refresh(task)
-                except Exception as refresh_error:
-                    # Если refresh не удался (например, задача была удалена), делаем rollback и выходим
-                    logger.warning(f"⚠️ Не удалось обновить задачу {task_id} из БД: {refresh_error}")
+                    # Атомарный UPDATE для обновления статистики задачи
+                    # ВАЖНО: Используем NOWAIT для немедленного обнаружения блокировок
+                    update_query = update(MonitoringTask).where(
+                        MonitoringTask.id == task_id
+                    ).values(
+                        total_checks=MonitoringTask.total_checks + 1,
+                        last_check=now,
+                        next_check=next_check
+                    )
+                    
+                    logger.debug(f"🔄 ParsingWorker: Обновляем задачу {task_id} через атомарный UPDATE (total_checks+1, last_check, next_check)")
+                    
+                    await asyncio.wait_for(
+                        task_db_session.execute(update_query),
+                        timeout=5.0  # Уменьшен таймаут до 5 секунд
+                    )
+                    
+                    logger.info(f"⏰ ParsingWorker: Установлена следующая проверка для задачи {task_id}: {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+                    if task_logger:
+                        task_logger.info(f"⏰ Следующая проверка в {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    # Обновляем объект в памяти для дальнейшего использования
+                    task.last_check = now
+                    task.next_check = next_check
+                    # total_checks будет обновлен после commit через refresh
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"⏱️ ParsingWorker: Таймаут при обновлении задачи {task_id} (5с), возможна блокировка БД")
+                    logger.error(f"   Это может означать, что другой процесс обновляет эту задачу одновременно")
                     try:
                         await task_db_session.rollback()
                     except Exception:
                         pass
-                    # Пытаемся загрузить задачу заново
-                    task = await task_db_session.get(MonitoringTask, task_id)
-                    if not task:
-                        logger.error(f"❌ Задача {task_id} не найдена в БД после ошибки refresh")
-                        return
-                    logger.info(f"✅ Задача {task_id} перезагружена из БД")
-                
-                task.total_checks += 1
-                task.last_check = datetime.now()
-                
-                # ВАЖНО: Обновляем next_check после завершения парсинга
-                # Это гарантирует, что задача будет запускаться повторно через заданный интервал
-                from datetime import timedelta
-                task.next_check = datetime.now() + timedelta(seconds=task.check_interval)
-                logger.info(f"⏰ ParsingWorker: Установлена следующая проверка для задачи {task_id}: {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-                if task_logger:
-                    task_logger.info(f"⏰ Следующая проверка в {task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+                    # Продолжаем работу, но статистика может быть не обновлена
+                except Exception as update_error:
+                    logger.error(f"❌ ParsingWorker: Ошибка при обновлении задачи {task_id}: {update_error}")
+                    logger.error(f"   Тип ошибки: {type(update_error).__name__}")
+                    try:
+                        await task_db_session.rollback()
+                    except Exception:
+                        pass
+                    # Продолжаем работу, но статистика может быть не обновлена
                 
                 # ВАЖНО: После успешного выполнения добавляем задачу обратно в RabbitMQ очередь
                 # с задержкой равной check_interval для повторного запуска
@@ -620,13 +643,19 @@ class ParsingWorker:
                             if task_logger:
                                 task_logger.error(f"❌ Ошибка при обработке результатов: {process_error}")
                             try:
+                                # ВАЖНО: Если UPDATE уже выполнен выше, commit должен быть быстрым
                                 await asyncio.wait_for(
                                     task_db_session.commit(),
-                                    timeout=10.0  # Таймаут 10 секунд для commit
+                                    timeout=5.0  # Уменьшен таймаут до 5 секунд
                                 )
+                                # Обновляем объект из БД для получения актуального total_checks
+                                try:
+                                    await task_db_session.refresh(task, attribute_names=['total_checks', 'items_found'])
+                                except Exception:
+                                    pass  # Если refresh не удался, не критично
                                 logger.info(f"✅ ParsingWorker: Задача {task_id} обновлена в БД после ошибки results_processor: проверок={task.total_checks}, найдено={task.items_found}")
                             except asyncio.TimeoutError:
-                                logger.error(f"⏱️ ParsingWorker: Таймаут при сохранении задачи {task_id} после ошибки (10с), БД может быть перегружена")
+                                logger.error(f"⏱️ ParsingWorker: Таймаут при сохранении задачи {task_id} после ошибки (5с), возможна блокировка БД")
                                 try:
                                     await task_db_session.rollback()
                                 except Exception:
@@ -650,16 +679,22 @@ class ParsingWorker:
                         task_logger.info(f"ℹ️ Предметы не найдены (после фильтрации)")
                     
                     # Если предметы не найдены, results_processor не вызывается, нужно сохранить изменения вручную
+                    # ВАЖНО: UPDATE уже выполнен выше, commit должен быть быстрым
                     try:
                         await asyncio.wait_for(
                             task_db_session.commit(),
-                            timeout=10.0  # Таймаут 10 секунд для commit
+                            timeout=5.0  # Уменьшен таймаут до 5 секунд
                         )
+                        # Обновляем объект из БД для получения актуального total_checks
+                        try:
+                            await task_db_session.refresh(task, attribute_names=['total_checks', 'items_found'])
+                        except Exception:
+                            pass  # Если refresh не удался, не критично
                         logger.info(f"✅ ParsingWorker: Задача {task_id} обновлена в БД: проверок={task.total_checks}, найдено={task.items_found}, next_check={task.next_check.strftime('%Y-%m-%d %H:%M:%S')}")
                         if task_logger:
                             task_logger.info(f"✅ Задача обновлена: проверок={task.total_checks}, найдено={task.items_found}")
                     except asyncio.TimeoutError:
-                        logger.error(f"⏱️ ParsingWorker: Таймаут при сохранении задачи {task_id} (10с), БД может быть перегружена")
+                        logger.error(f"⏱️ ParsingWorker: Таймаут при сохранении задачи {task_id} (5с), возможна блокировка БД")
                         try:
                             await task_db_session.rollback()
                         except Exception:

@@ -691,22 +691,38 @@ class MonitoringService:
             
             # Обновляем через UPDATE запрос, чтобы избежать проблем с ORM
             # ВАЖНО: Добавляем таймаут для предотвращения долгих блокировок
+            # ВАЖНО: Уменьшен таймаут до 5 секунд для быстрого обнаружения блокировок
             try:
+                logger.debug(f"🔄 MonitoringService: Обновляем next_check для задачи {task_id} через атомарный UPDATE")
+                start_time = datetime.now()
+                
                 await asyncio.wait_for(
                     session.execute(
                         update(MonitoringTask)
                         .where(MonitoringTask.id == task_id)
                         .values(next_check=next_check)
                     ),
-                    timeout=10.0  # Таймаут 10 секунд для UPDATE запроса
+                    timeout=5.0  # Уменьшен таймаут до 5 секунд для быстрого обнаружения блокировок
                 )
+                
+                update_duration = (datetime.now() - start_time).total_seconds()
+                if update_duration > 1.0:
+                    logger.warning(f"⚠️ Задача {task_id}: UPDATE next_check занял {update_duration:.2f}с (медленно, возможна блокировка)")
+                
+                commit_start = datetime.now()
                 await asyncio.wait_for(
                     session.commit(),
-                    timeout=5.0  # Таймаут 5 секунд для commit
+                    timeout=3.0  # Уменьшен таймаут до 3 секунд для commit
                 )
+                
+                commit_duration = (datetime.now() - commit_start).total_seconds()
+                if commit_duration > 1.0:
+                    logger.warning(f"⚠️ Задача {task_id}: COMMIT next_check занял {commit_duration:.2f}с (медленно, возможна блокировка)")
+                
                 logger.info(f"⏰ Задача {task_id}: Следующая проверка в {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
             except asyncio.TimeoutError:
-                logger.error(f"⏱️ Задача {task_id}: Таймаут при обновлении next_check (10с), БД может быть перегружена")
+                logger.error(f"⏱️ Задача {task_id}: Таймаут при обновлении next_check (5с), возможна блокировка БД")
+                logger.error(f"   Это может означать, что другой процесс (parsing-worker или другой monitoring-service) обновляет эту задачу одновременно")
                 try:
                     await session.rollback()
                 except Exception:
