@@ -278,3 +278,4 @@ docker compose exec parsing-worker python3 /app/tests/test_db_lock_comparison.py
 ---
 
 **Система готова к production использованию!** ✅
+

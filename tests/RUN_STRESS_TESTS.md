@@ -96,3 +96,4 @@ python3 tests/test_db_lock_comparison.py
 
 ✅ ТЕСТ ПРОЙДЕН: Блокировки не обнаружены, защита работает!
 ```
+
